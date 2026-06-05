@@ -13,16 +13,16 @@ const MAX_PARTICIPANTS = 5;
 const LIVEKIT_HOST = 'https://gwovi-thg5bfsf.livekit.cloud';
 
 // ---- In-memory join requests ----
-// Keyed by room, each entry: { username, status: 'pending'|'approved'|'denied', ts }
-// This resets if the server restarts (fine for now; not for production scale).
 const requests = {}; // requests[room] = { [username]: {status, ts} }
+
+// ---- In-memory event names (host sets when going live) ----
+const eventNames = {}; // eventNames[room] = "Baby shower"
 
 function roomRequests(room) {
   if (!requests[room]) requests[room] = {};
   return requests[room];
 }
 
-// Remove requests older than 2 minutes so the list stays clean.
 function pruneOld(room) {
   const now = Date.now();
   const list = roomRequests(room);
@@ -37,7 +37,7 @@ app.get('/', (req, res) => {
   res.send('GwoVi token server is running.');
 });
 
-// ---- Token minting (host goes live, or approved joiner connects) ----
+// ---- Token minting ----
 app.post('/token', async (req, res) => {
   try {
     const { username, room } = req.body || {};
@@ -51,7 +51,6 @@ app.post('/token', async (req, res) => {
       return res.status(500).json({ error: 'Server missing LiveKit credentials' });
     }
 
-    // Capacity check.
     try {
       const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
       const participants = await svc.listParticipants(room);
@@ -82,7 +81,26 @@ app.post('/token', async (req, res) => {
   }
 });
 
-// ---- Joiner: ask to join (creates a pending request) ----
+// ---- Host: register the event name for a room ----
+app.post('/setevent', (req, res) => {
+  const { room, event } = req.body || {};
+  if (!room || !event) {
+    return res.status(400).json({ error: 'room and event are required' });
+  }
+  eventNames[room] = event;
+  res.json({ ok: true });
+});
+
+// ---- Joiner: read the event name before joining ----
+app.get('/event', (req, res) => {
+  const room = req.query.room;
+  if (!room) {
+    return res.status(400).json({ error: 'room is required' });
+  }
+  res.json({ event: eventNames[room] || '' });
+});
+
+// ---- Joiner: ask to join ----
 app.post('/request', (req, res) => {
   const { username, room } = req.body || {};
   if (!username || !room) {
@@ -94,7 +112,7 @@ app.post('/request', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- Host: see all pending requests for a room ----
+// ---- Host: see pending requests ----
 app.get('/pending', (req, res) => {
   const room = req.query.room;
   if (!room) {
@@ -108,7 +126,7 @@ app.get('/pending', (req, res) => {
   res.json({ pending });
 });
 
-// ---- Host: approve (or deny) a specific joiner by name ----
+// ---- Host: approve/deny ----
 app.post('/approve', (req, res) => {
   const { username, room, approve } = req.body || {};
   if (!username || !room) {
@@ -123,7 +141,7 @@ app.post('/approve', (req, res) => {
   res.json({ ok: true, status: list[username].status });
 });
 
-// ---- Joiner: check whether they've been approved yet ----
+// ---- Joiner: check approval status ----
 app.get('/check', (req, res) => {
   const { room, username } = req.query;
   if (!room || !username) {
