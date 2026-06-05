@@ -1,10 +1,18 @@
 import express from 'express';
 import cors from 'cors';
-import { AccessToken } from 'livekit-server-sdk';
+import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Max people allowed in a room (host + 4 others). Bump this later
+// or make it subscription-based when you add paid tiers.
+const MAX_PARTICIPANTS = 5;
+
+// Your LiveKit project's HTTPS host, used to query room state.
+// This is your wss:// URL with https:// instead.
+const LIVEKIT_HOST = 'https://gwovi-thg5bfsf.livekit.cloud';
 
 app.get('/', (req, res) => {
   res.send('GwoVi token server is running.');
@@ -23,6 +31,19 @@ app.post('/token', async (req, res) => {
 
     if (!apiKey || !apiSecret) {
       return res.status(500).json({ error: 'Server missing LiveKit credentials' });
+    }
+
+    // --- Capacity check: count who's already in the room ---
+    try {
+      const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+      const participants = await svc.listParticipants(room);
+      if (participants.length >= MAX_PARTICIPANTS) {
+        return res.status(403).json({ error: 'Room is full' });
+      }
+    } catch (capErr) {
+      // If the room doesn't exist yet, listParticipants can throw —
+      // that just means the room is empty, so we let the join proceed.
+      console.log('Capacity check note:', capErr?.message || capErr);
     }
 
     const at = new AccessToken(apiKey, apiSecret, {
