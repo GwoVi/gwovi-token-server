@@ -81,13 +81,17 @@ app.post('/token', async (req, res) => {
   }
 });
 
-// ---- Host: register the event name for a room ----
+// ---- Host: register (or clear) the event name for a room ----
 app.post('/setevent', (req, res) => {
   const { room, event } = req.body || {};
-  if (!room || !event) {
-    return res.status(400).json({ error: 'room and event are required' });
+  if (!room) {
+    return res.status(400).json({ error: 'room is required' });
   }
-  eventNames[room] = event;
+  if (event && event.length > 0) {
+    eventNames[room] = event;
+  } else {
+    delete eventNames[room];
+  }
   res.json({ ok: true });
 });
 
