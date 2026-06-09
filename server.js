@@ -1,6 +1,13 @@
 import express from 'express';
 import cors from 'cors';
-import { AccessToken, RoomServiceClient } from 'livekit-server-sdk';
+import {
+  AccessToken,
+  RoomServiceClient,
+  EgressClient,
+  EncodedFileOutput,
+  EncodedFileType,
+  S3Upload,
+} from 'livekit-server-sdk';
 
 const app = express();
 app.use(cors());
@@ -17,6 +24,9 @@ const requests = {}; // requests[room] = { [username]: {status, ts} }
 
 // ---- In-memory event names (host sets when going live) ----
 const eventNames = {}; // eventNames[room] = "Baby shower"
+
+// ---- In-memory active recordings ----
+const recordings = {}; // recordings[room] = egressId
 
 function roomRequests(room) {
   if (!requests[room]) requests[room] = {};
@@ -78,6 +88,101 @@ app.post('/token', async (req, res) => {
   } catch (err) {
     console.error('Token error:', err);
     res.status(500).json({ error: 'Failed to create token' });
+  }
+});
+
+// ---- Start recording (Room Composite -> R2) ----
+app.post('/start-recording', async (req, res) => {
+  try {
+    const { room } = req.body || {};
+    if (!room) {
+      return res.status(400).json({ error: 'room is required' });
+    }
+
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+    if (!apiKey || !apiSecret) {
+      return res.status(500).json({ error: 'Server missing LiveKit credentials' });
+    }
+
+    const r2AccessKey = process.env.R2_ACCESS_KEY_ID;
+    const r2Secret = process.env.R2_SECRET_ACCESS_KEY;
+    const r2Endpoint = process.env.R2_ENDPOINT;
+    const r2Bucket = process.env.R2_BUCKET;
+    if (!r2AccessKey || !r2Secret || !r2Endpoint || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    // Stop any existing recording for this room first (avoid duplicates).
+    if (recordings[room]) {
+      return res
+        .status(409)
+        .json({ error: 'A recording is already running for this room' });
+    }
+
+    const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
+
+    // Unique filename: room + timestamp.
+    const stamp = Date.now();
+    const filepath = `${room}/${room}-${stamp}.mp4`;
+
+    const fileOutput = new EncodedFileOutput({
+      fileType: EncodedFileType.MP4,
+      filepath: filepath,
+      output: {
+        case: 's3',
+        value: new S3Upload({
+          accessKey: r2AccessKey,
+          secret: r2Secret,
+          bucket: r2Bucket,
+          endpoint: r2Endpoint,
+          region: 'auto',
+          forcePathStyle: true,
+        }),
+      },
+    });
+
+    const info = await egressClient.startRoomCompositeEgress(room, {
+      file: fileOutput,
+    });
+
+    recordings[room] = info.egressId;
+
+    res.json({ ok: true, egressId: info.egressId, filepath: filepath });
+  } catch (err) {
+    console.error('Start recording error:', err);
+    res.status(500).json({ error: 'Failed to start recording' });
+  }
+});
+
+// ---- Stop recording ----
+app.post('/stop-recording', async (req, res) => {
+  try {
+    const { room } = req.body || {};
+    if (!room) {
+      return res.status(400).json({ error: 'room is required' });
+    }
+
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+    if (!apiKey || !apiSecret) {
+      return res.status(500).json({ error: 'Server missing LiveKit credentials' });
+    }
+
+    const egressId = recordings[room];
+    if (!egressId) {
+      return res.status(404).json({ error: 'No active recording for this room' });
+    }
+
+    const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
+    await egressClient.stopEgress(egressId);
+
+    delete recordings[room];
+
+    res.json({ ok: true, egressId: egressId });
+  } catch (err) {
+    console.error('Stop recording error:', err);
+    res.status(500).json({ error: 'Failed to stop recording' });
   }
 });
 
