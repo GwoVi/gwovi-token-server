@@ -8,6 +8,8 @@ import {
   EncodedFileType,
   S3Upload,
 } from 'livekit-server-sdk';
+import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const app = express();
 app.use(cors());
@@ -41,6 +43,22 @@ function pruneOld(room) {
       delete list[name];
     }
   }
+}
+
+// Builds an S3 client pointed at R2. Returns null if creds are missing.
+function makeR2Client() {
+  const r2AccessKey = process.env.R2_ACCESS_KEY_ID;
+  const r2Secret = process.env.R2_SECRET_ACCESS_KEY;
+  const r2Endpoint = process.env.R2_ENDPOINT;
+  if (!r2AccessKey || !r2Secret || !r2Endpoint) return null;
+  return new S3Client({
+    region: 'auto',
+    endpoint: r2Endpoint,
+    credentials: {
+      accessKeyId: r2AccessKey,
+      secretAccessKey: r2Secret,
+    },
+  });
 }
 
 app.get('/', (req, res) => {
@@ -183,6 +201,59 @@ app.post('/stop-recording', async (req, res) => {
   } catch (err) {
     console.error('Stop recording error:', err);
     res.status(500).json({ error: 'Failed to stop recording' });
+  }
+});
+
+// ---- List recordings for a room, with temporary signed playback URLs ----
+app.get('/recordings', async (req, res) => {
+  try {
+    const room = req.query.room;
+    if (!room) {
+      return res.status(400).json({ error: 'room is required' });
+    }
+
+    const r2Bucket = process.env.R2_BUCKET;
+    const s3 = makeR2Client();
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    // List everything stored under this room's folder.
+    const listed = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: r2Bucket,
+        Prefix: `${room}/`,
+      })
+    );
+
+    const objects = listed.Contents || [];
+
+    // Keep only the .mp4 video files (skip LiveKit's .json manifests).
+    const videos = objects.filter((o) => o.Key && o.Key.endsWith('.mp4'));
+
+    // Newest first.
+    videos.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+
+    // Build a temporary signed URL (valid 1 hour) for each one.
+    const out = [];
+    for (const v of videos) {
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: r2Bucket, Key: v.Key }),
+        { expiresIn: 3600 }
+      );
+      out.push({
+        key: v.Key,
+        url: url,
+        size: v.Size,
+        modified: v.LastModified,
+      });
+    }
+
+    res.json({ recordings: out });
+  } catch (err) {
+    console.error('List recordings error:', err);
+    res.status(500).json({ error: 'Failed to list recordings' });
   }
 });
 
