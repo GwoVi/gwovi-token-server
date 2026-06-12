@@ -140,9 +140,22 @@ app.post('/start-recording', async (req, res) => {
 
     const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
 
-    // Unique filename: room + timestamp.
+    // Build the filename so the event name rides along with the file.
+    // The gallery parses this back out to show "Event name" + date.
+    // Format: {room}/{EventName}__{timestamp}.mp4
+    // The double underscore "__" is the separator the app looks for, so a
+    // single underscore inside an event name (e.g. "Baby_shower") is safe.
     const stamp = Date.now();
-    const filepath = `${room}/${room}-${stamp}.mp4`;
+    const rawEvent = (eventNames[room] || '').trim();
+    // Keep letters, numbers, spaces, and hyphens; turn anything else into
+    // a space; collapse runs of whitespace to single underscores.
+    const safeEvent = rawEvent
+      .replace(/[^A-Za-z0-9 \-]/g, ' ')
+      .replace(/\s+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 60);
+    const namePart = safeEvent.length > 0 ? safeEvent : room;
+    const filepath = `${room}/${namePart}__${stamp}.mp4`;
 
     const fileOutput = new EncodedFileOutput({
       fileType: EncodedFileType.MP4,
