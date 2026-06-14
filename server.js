@@ -8,7 +8,12 @@ import {
   EncodedFileType,
   S3Upload,
 } from 'livekit-server-sdk';
-import { S3Client, ListObjectsV2Command, GetObjectCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  ListObjectsV2Command,
+  GetObjectCommand,
+  DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const app = express();
@@ -267,6 +272,38 @@ app.get('/recordings', async (req, res) => {
   } catch (err) {
     console.error('List recordings error:', err);
     res.status(500).json({ error: 'Failed to list recordings' });
+  }
+});
+
+// ---- Delete one recording from R2 by its key ----
+app.post('/delete-recording', async (req, res) => {
+  try {
+    const { key } = req.body || {};
+    if (!key) {
+      return res.status(400).json({ error: 'key is required' });
+    }
+
+    // Safety guard: only delete a real recording object. It must live inside
+    // a room folder (have a "/") and be an .mp4 file. This prevents an empty
+    // or malformed key from targeting anything unexpected.
+    if (typeof key !== 'string' || !key.includes('/') || !key.endsWith('.mp4')) {
+      return res.status(400).json({ error: 'invalid key' });
+    }
+
+    const r2Bucket = process.env.R2_BUCKET;
+    const s3 = makeR2Client();
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    await s3.send(
+      new DeleteObjectCommand({ Bucket: r2Bucket, Key: key })
+    );
+
+    res.json({ ok: true, key: key });
+  } catch (err) {
+    console.error('Delete recording error:', err);
+    res.status(500).json({ error: 'Failed to delete recording' });
   }
 });
 
