@@ -104,6 +104,7 @@ app.post('/token', async (req, res) => {
       room: room,
       canPublish: true,
       canSubscribe: true,
+      canUpdateOwnMetadata: true,
     });
 
     const token = await at.toJwt();
