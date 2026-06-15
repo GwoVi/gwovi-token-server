@@ -6,6 +6,7 @@ import {
   EgressClient,
   EncodedFileOutput,
   EncodedFileType,
+  EncodingOptionsPreset,
   S3Upload,
 } from 'livekit-server-sdk';
 import {
@@ -181,6 +182,13 @@ app.post('/start-recording', async (req, res) => {
 
     const info = await egressClient.startRoomCompositeEgress(room, {
       file: fileOutput,
+    }, {
+      // Record on a PORTRAIT canvas (720 wide x 1280 tall) so an upright
+      // phone feed fills the frame instead of being boxed into the center
+      // with black bars on the sides. Without this, Egress defaults to a
+      // landscape canvas and letterboxes the tall video.
+      layout: 'grid',
+      encodingOptions: EncodingOptionsPreset.PORTRAIT_H720_30,
     });
 
     recordings[room] = info.egressId;
