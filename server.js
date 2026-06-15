@@ -21,8 +21,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Max people allowed in a room (host + 4 others).
-const MAX_PARTICIPANTS = 5;
+// ---- Free-tier limits ----
+// These are the FREE tier limits. When StoreKit/paid tiers are added later,
+// paid users should bypass these (e.g. higher cap, no session timeout).
+// Max people allowed in a room (host + 2 others) on the free tier.
+const MAX_PARTICIPANTS = 3;
+// How long a free-tier session can run before it auto-ends (milliseconds).
+const SESSION_LIMIT_MS = 10 * 60 * 1000; // 10 minutes
+
+// Tracks the auto-end timer for each room so we can clear it if the room
+// ends early. Note: timers live in memory, so a server restart (e.g. a
+// Render redeploy) clears any pending timer. Acceptable for a soft free-tier
+// limit; revisit if we ever need hard billing enforcement.
+const sessionTimers = {}; // sessionTimers[room] = Timeout
 
 // Your LiveKit project's HTTPS host (wss:// URL with https:// instead).
 const LIVEKIT_HOST = 'https://gwovi-thg5bfsf.livekit.cloud';
@@ -48,6 +59,34 @@ function pruneOld(room) {
     if (now - list[name].ts > 120000) {
       delete list[name];
     }
+  }
+}
+
+// Arms the free-tier session timer for a room. After SESSION_LIMIT_MS, the
+// room is deleted, which disconnects everyone. Clears any existing timer for
+// the room first so we don't stack them.
+function startSessionTimer(room, apiKey, apiSecret) {
+  if (sessionTimers[room]) {
+    clearTimeout(sessionTimers[room]);
+  }
+  sessionTimers[room] = setTimeout(async () => {
+    try {
+      const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+      await svc.deleteRoom(room);
+      console.log(`Session limit reached: ended room ${room}`);
+    } catch (e) {
+      console.log('Session auto-end note:', e?.message || e);
+    }
+    delete sessionTimers[room];
+    delete recordings[room];
+  }, SESSION_LIMIT_MS);
+}
+
+// Clears a room's session timer (e.g. when the host leaves early).
+function clearSessionTimer(room) {
+  if (sessionTimers[room]) {
+    clearTimeout(sessionTimers[room]);
+    delete sessionTimers[room];
   }
 }
 
@@ -322,10 +361,18 @@ app.post('/setevent', (req, res) => {
   if (!room) {
     return res.status(400).json({ error: 'room is required' });
   }
+  const apiKey = process.env.LIVEKIT_API_KEY;
+  const apiSecret = process.env.LIVEKIT_API_SECRET;
   if (event && event.length > 0) {
     eventNames[room] = event;
+    // Host just went live -> start the free-tier session countdown.
+    if (apiKey && apiSecret) {
+      startSessionTimer(room, apiKey, apiSecret);
+    }
   } else {
     delete eventNames[room];
+    // Host cleared the event (left) -> cancel the countdown.
+    clearSessionTimer(room);
   }
   res.json({ ok: true });
 });
