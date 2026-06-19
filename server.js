@@ -14,12 +14,14 @@ import {
   ListObjectsV2Command,
   GetObjectCommand,
   DeleteObjectCommand,
+  PutObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Raised limit so base64-encoded snapshot images fit in the JSON body.
+app.use(express.json({ limit: '15mb' }));
 
 // ---- Free-tier limits ----
 // These are the FREE tier limits. When StoreKit/paid tiers are added later,
@@ -294,25 +296,34 @@ app.get('/recordings', async (req, res) => {
 
     const objects = listed.Contents || [];
 
-    // Keep only the .mp4 video files (skip LiveKit's .json manifests).
-    const videos = objects.filter((o) => o.Key && o.Key.endsWith('.mp4'));
+    // Keep video files (.mp4) and snapshot images (.jpg/.jpeg); skip LiveKit's
+    // .json manifests and anything else.
+    const media = objects.filter(
+      (o) =>
+        o.Key &&
+        (o.Key.endsWith('.mp4') ||
+          o.Key.endsWith('.jpg') ||
+          o.Key.endsWith('.jpeg'))
+    );
 
     // Newest first.
-    videos.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+    media.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
     // Build a temporary signed URL (valid 1 hour) for each one.
     const out = [];
-    for (const v of videos) {
+    for (const v of media) {
       const url = await getSignedUrl(
         s3,
         new GetObjectCommand({ Bucket: r2Bucket, Key: v.Key }),
         { expiresIn: 3600 }
       );
+      const isPhoto = v.Key.endsWith('.jpg') || v.Key.endsWith('.jpeg');
       out.push({
         key: v.Key,
         url: url,
         size: v.Size,
         modified: v.LastModified,
+        type: isPhoto ? 'photo' : 'video',
       });
     }
 
@@ -320,6 +331,51 @@ app.get('/recordings', async (req, res) => {
   } catch (err) {
     console.error('List recordings error:', err);
     res.status(500).json({ error: 'Failed to list recordings' });
+  }
+});
+
+// ---- Upload a snapshot image (captured on-device) to R2 ----
+// Body: { room, event, image }  where image is base64 JPEG (no data: prefix).
+// Stored as {room}/{EventName}__{timestamp}.jpg so it appears in the gallery
+// alongside videos and is covered by the same 24h auto-delete lifecycle rule.
+app.post('/upload-snapshot', async (req, res) => {
+  try {
+    const { room, event, image } = req.body || {};
+    if (!room || !image) {
+      return res.status(400).json({ error: 'room and image are required' });
+    }
+
+    const r2Bucket = process.env.R2_BUCKET;
+    const s3 = makeR2Client();
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    // Decode the base64 image into bytes.
+    const buffer = Buffer.from(image, 'base64');
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ error: 'image could not be decoded' });
+    }
+
+    // Same naming convention as recordings: {room}/{EventName}__{timestamp}.jpg
+    const safeEvent = (event && String(event).trim()) || 'GwoVi';
+    const namePart = safeEvent.replace(/[^a-zA-Z0-9-_ ]/g, '').trim() || 'GwoVi';
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const key = `${room}/${namePart}__${stamp}.jpg`;
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: r2Bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: 'image/jpeg',
+      })
+    );
+
+    res.json({ ok: true, key });
+  } catch (err) {
+    console.error('Upload snapshot error:', err);
+    res.status(500).json({ error: 'Failed to upload snapshot' });
   }
 });
 
