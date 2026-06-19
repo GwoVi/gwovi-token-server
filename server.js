@@ -387,10 +387,13 @@ app.post('/delete-recording', async (req, res) => {
       return res.status(400).json({ error: 'key is required' });
     }
 
-    // Safety guard: only delete a real recording object. It must live inside
-    // a room folder (have a "/") and be an .mp4 file. This prevents an empty
-    // or malformed key from targeting anything unexpected.
-    if (typeof key !== 'string' || !key.includes('/') || !key.endsWith('.mp4')) {
+    // Safety guard: only delete a real media object. It must live inside a
+    // room folder (have a "/") and be a video (.mp4) or photo (.jpg/.jpeg).
+    // This prevents an empty or malformed key from targeting anything
+    // unexpected.
+    const isMedia =
+      key.endsWith('.mp4') || key.endsWith('.jpg') || key.endsWith('.jpeg');
+    if (typeof key !== 'string' || !key.includes('/') || !isMedia) {
       return res.status(400).json({ error: 'invalid key' });
     }
 
