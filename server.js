@@ -6,7 +6,7 @@ import {
   EgressClient,
   EncodedFileOutput,
   EncodedFileType,
-  EncodingOptionsPreset,
+  EncodingOptions,
   S3Upload,
 } from 'livekit-server-sdk';
 import {
@@ -221,17 +221,27 @@ app.post('/start-recording', async (req, res) => {
       },
     });
 
+    // Use EXPLICIT recording dimensions instead of a canned preset. The preset
+    // (PORTRAIT_H720_30 / H1080_30) was producing a narrower-than-phone frame,
+    // which Apple Photos pillarboxes with black bars on the sides. Here we set
+    // a true 9:16 phone-portrait canvas (1080 wide x 1920 tall) so the saved
+    // file is full phone-shape and fills the screen in Apple Photos too.
+    //
+    // We also raise the video bitrate a bit to keep 1080p looking clean.
+    const encoding = new EncodingOptions({
+      width: 1080,
+      height: 1920,
+      framerate: 30,
+      videoBitrate: 4500, // kbps
+      videoCodec: 0,      // H.264 baseline default for broad compatibility
+    });
+
     const info = await egressClient.startRoomCompositeEgress(room, {
       file: fileOutput,
     }, {
-      // Record on a PORTRAIT canvas (720 wide x 1280 tall) so an upright
-      // phone feed fills the frame instead of being boxed into the center
-      // with black bars on the sides. Reverted from 1080p back to 720p
-      // (PORTRAIT_H720_30) because the 1080p preset changed the frame shape
-      // and produced black side-bars when saved to Apple Photos. 720p is the
-      // known-good shape that filled the frame cleanly.
+      // 'grid' layout composites the participant feed(s) onto the canvas above.
       layout: 'grid',
-      encodingOptions: EncodingOptionsPreset.PORTRAIT_H720_30,
+      encodingOptions: encoding,
     });
 
     recordings[room] = info.egressId;
