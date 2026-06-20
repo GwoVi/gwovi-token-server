@@ -224,12 +224,14 @@ app.post('/start-recording', async (req, res) => {
     const info = await egressClient.startRoomCompositeEgress(room, {
       file: fileOutput,
     }, {
-      // Record on a PORTRAIT canvas (720 wide x 1280 tall) so an upright
-      // phone feed fills the frame instead of being boxed into the center
-      // with black bars on the sides. Without this, Egress defaults to a
-      // landscape canvas and letterboxes the tall video.
+      // Record on a PORTRAIT canvas so an upright phone feed fills the frame
+      // instead of being boxed into the center with black bars on the sides.
+      // Bumped from 720p (PORTRAIT_H720_30) to 1080p (PORTRAIT_H1080_30) for
+      // higher-quality recordings. Note: final sharpness is still capped by
+      // what the live LiveKit stream publishes; 1080p output won't add detail
+      // the source didn't send, but it preserves more of what it does send.
       layout: 'grid',
-      encodingOptions: EncodingOptionsPreset.PORTRAIT_H720_30,
+      encodingOptions: EncodingOptionsPreset.PORTRAIT_H1080_30,
     });
 
     recordings[room] = info.egressId;
