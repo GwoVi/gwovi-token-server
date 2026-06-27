@@ -47,7 +47,15 @@ const requests = {}; // requests[room] = { [username]: {status, ts} }
 const eventNames = {}; // eventNames[room] = "Baby shower"
 
 // ---- In-memory active recordings ----
-const recordings = {}; // recordings[room] = egressId
+// CHANGED: each person now records their OWN feed independently, so we track
+// one egressId PER username inside each room instead of a single egressId for
+// the whole room. Shape: recordings[room] = { [username]: egressId }
+const recordings = {}; // recordings[room][username] = egressId
+
+function roomRecordings(room) {
+  if (!recordings[room]) recordings[room] = {};
+  return recordings[room];
+}
 
 function roomRequests(room) {
   if (!requests[room]) requests[room] = {};
@@ -108,6 +116,17 @@ function makeR2Client() {
   });
 }
 
+// Turns a raw event name into a filename-safe token. Keeps letters, numbers,
+// spaces and hyphens; collapses whitespace to single underscores; trims to a
+// reasonable length. Returns '' if nothing usable remains.
+function safeToken(raw, max) {
+  return (raw || '')
+    .replace(/[^A-Za-z0-9 \-]/g, ' ')
+    .replace(/\s+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, max || 60);
+}
+
 app.get('/', (req, res) => {
   res.send('GwoVi token server is running.');
 });
@@ -157,12 +176,16 @@ app.post('/token', async (req, res) => {
   }
 });
 
-// ---- Start recording (Room Composite -> R2) ----
+// ---- Start recording (Participant Egress -> R2) ----
+// CHANGED: this now records ONE participant's own feed, not the whole room.
+// The app sends { room, username } where username is the person who tapped
+// record. Each person records independently, producing a separate file.
+// Filename: {room}/{EventName}__{Username}__{timestamp}.mp4
 app.post('/start-recording', async (req, res) => {
   try {
-    const { room } = req.body || {};
-    if (!room) {
-      return res.status(400).json({ error: 'room is required' });
+    const { room, username } = req.body || {};
+    if (!room || !username) {
+      return res.status(400).json({ error: 'room and username are required' });
     }
 
     const apiKey = process.env.LIVEKIT_API_KEY;
@@ -179,31 +202,27 @@ app.post('/start-recording', async (req, res) => {
       return res.status(500).json({ error: 'Server missing R2 credentials' });
     }
 
-    // Stop any existing recording for this room first (avoid duplicates).
-    if (recordings[room]) {
+    // Only block a duplicate recording for THIS person (others may record too).
+    const roomRecs = roomRecordings(room);
+    if (roomRecs[username]) {
       return res
         .status(409)
-        .json({ error: 'A recording is already running for this room' });
+        .json({ error: 'You already have a recording running' });
     }
 
     const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
 
-    // Build the filename so the event name rides along with the file.
-    // The gallery parses this back out to show "Event name" + date.
-    // Format: {room}/{EventName}__{timestamp}.mp4
-    // The double underscore "__" is the separator the app looks for, so a
-    // single underscore inside an event name (e.g. "Baby_shower") is safe.
+    // Build the filename so the event name AND the username ride along with the
+    // file. The gallery parses the event name back out to show "Event name" +
+    // date; the username makes each participant's file identifiable.
+    // Format: {room}/{EventName}__{Username}__{timestamp}.mp4
+    // The double underscore "__" is the separator the app looks for.
     const stamp = Date.now();
-    const rawEvent = (eventNames[room] || '').trim();
-    // Keep letters, numbers, spaces, and hyphens; turn anything else into
-    // a space; collapse runs of whitespace to single underscores.
-    const safeEvent = rawEvent
-      .replace(/[^A-Za-z0-9 \-]/g, ' ')
-      .replace(/\s+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .slice(0, 60);
-    const namePart = safeEvent.length > 0 ? safeEvent : room;
-    const filepath = `${room}/${namePart}__${stamp}.mp4`;
+    const safeEvent = safeToken((eventNames[room] || '').trim(), 60);
+    const safeUser = safeToken(username, 40);
+    const eventPart = safeEvent.length > 0 ? safeEvent : room;
+    const userPart = safeUser.length > 0 ? safeUser : 'user';
+    const filepath = `${room}/${eventPart}__${userPart}__${stamp}.mp4`;
 
     const fileOutput = new EncodedFileOutput({
       fileType: EncodedFileType.MP4,
@@ -221,13 +240,9 @@ app.post('/start-recording', async (req, res) => {
       },
     });
 
-    // Use EXPLICIT recording dimensions instead of a canned preset. The preset
-    // (PORTRAIT_H720_30 / H1080_30) was producing a narrower-than-phone frame,
-    // which Apple Photos pillarboxes with black bars on the sides. Here we set
-    // a true 9:16 phone-portrait canvas (1080 wide x 1920 tall) so the saved
-    // file is full phone-shape and fills the screen in Apple Photos too.
-    //
-    // We also raise the video bitrate a bit to keep 1080p looking clean.
+    // Explicit recording dimensions (same as before) so the saved file is a
+    // true 9:16 phone-portrait canvas (1080 x 1920) and fills the screen in
+    // Apple Photos without black bars.
     const encoding = new EncodingOptions({
       width: 1080,
       height: 1920,
@@ -236,15 +251,19 @@ app.post('/start-recording', async (req, res) => {
       videoCodec: 0,      // H.264 baseline default for broad compatibility
     });
 
-    const info = await egressClient.startRoomCompositeEgress(room, {
-      file: fileOutput,
-    }, {
-      // 'grid' layout composites the participant feed(s) onto the canvas above.
-      layout: 'grid',
-      encodingOptions: encoding,
-    });
+    // Participant Egress records just this one participant's published feed.
+    // The participant is identified by their LiveKit identity, which we set to
+    // the username when minting their token (see /token above).
+    const info = await egressClient.startParticipantEgress(
+      room,
+      username,
+      {
+        file: fileOutput,
+        encodingOptions: encoding,
+      }
+    );
 
-    recordings[room] = info.egressId;
+    roomRecs[username] = info.egressId;
 
     res.json({ ok: true, egressId: info.egressId, filepath: filepath });
   } catch (err) {
@@ -254,11 +273,12 @@ app.post('/start-recording', async (req, res) => {
 });
 
 // ---- Stop recording ----
+// CHANGED: stops THIS person's recording only. App sends { room, username }.
 app.post('/stop-recording', async (req, res) => {
   try {
-    const { room } = req.body || {};
-    if (!room) {
-      return res.status(400).json({ error: 'room is required' });
+    const { room, username } = req.body || {};
+    if (!room || !username) {
+      return res.status(400).json({ error: 'room and username are required' });
     }
 
     const apiKey = process.env.LIVEKIT_API_KEY;
@@ -267,15 +287,16 @@ app.post('/stop-recording', async (req, res) => {
       return res.status(500).json({ error: 'Server missing LiveKit credentials' });
     }
 
-    const egressId = recordings[room];
+    const roomRecs = roomRecordings(room);
+    const egressId = roomRecs[username];
     if (!egressId) {
-      return res.status(404).json({ error: 'No active recording for this room' });
+      return res.status(404).json({ error: 'No active recording for you in this room' });
     }
 
     const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
     await egressClient.stopEgress(egressId);
 
-    delete recordings[room];
+    delete roomRecs[username];
 
     res.json({ ok: true, egressId: egressId });
   } catch (err) {
