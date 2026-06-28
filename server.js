@@ -202,15 +202,33 @@ app.post('/start-recording', async (req, res) => {
       return res.status(500).json({ error: 'Server missing R2 credentials' });
     }
 
-    // Only block a duplicate recording for THIS person (others may record too).
+    const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
+
+    // SELF-HEALING: if this person already has a recording entry, it may be a
+    // STALE one left behind by a recording that never cleanly stopped (app
+    // closed, crashed, or session dropped without hitting /stop-recording).
+    // A stale entry would otherwise block this user from EVER recording again
+    // until a server restart. So instead of rejecting with 409, we try to stop
+    // the old Egress (ignoring errors if it's already dead), clear the stale
+    // entry, and continue to start a fresh recording below.
     const roomRecs = roomRecordings(room);
     if (roomRecs[username]) {
-      return res
-        .status(409)
-        .json({ error: 'You already have a recording running' });
+      const oldEgressId = roomRecs[username];
+      try {
+        await egressClient.stopEgress(oldEgressId);
+        console.log(
+          `Cleared stale recording for ${username} in ${room} (egress ${oldEgressId})`
+        );
+      } catch (stopErr) {
+        // The old Egress is probably already gone — that's fine, we just want
+        // the stale entry cleared so this user can record again.
+        console.log(
+          `Stale recording cleanup note for ${username} in ${room}:`,
+          stopErr?.message || stopErr
+        );
+      }
+      delete roomRecs[username];
     }
-
-    const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
 
     // Build the filename so the event name AND the username ride along with the
     // file. The gallery parses the event name back out to show "Event name" +
@@ -294,8 +312,17 @@ app.post('/stop-recording', async (req, res) => {
     }
 
     const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
-    await egressClient.stopEgress(egressId);
-
+    // Always clear our in-memory entry, even if the stop call fails — a failed
+    // stop usually means the Egress already ended, and keeping a dead entry
+    // would block this user's next recording.
+    try {
+      await egressClient.stopEgress(egressId);
+    } catch (stopErr) {
+      console.log(
+        `Stop recording note for ${username} in ${room}:`,
+        stopErr?.message || stopErr
+      );
+    }
     delete roomRecs[username];
 
     res.json({ ok: true, egressId: egressId });
@@ -465,6 +492,9 @@ app.post('/setevent', (req, res) => {
     delete eventNames[room];
     // Host cleared the event (left) -> cancel the countdown.
     clearSessionTimer(room);
+    // Also clear any leftover recording entries for this room so a fresh
+    // session never inherits a stale "already recording" block.
+    delete recordings[room];
   }
   res.json({ ok: true });
 });
