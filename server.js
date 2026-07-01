@@ -224,6 +224,73 @@ app.get('/nearby', (req, res) => {
   res.json({ on: nearbyModes[room] === true });
 });
 
+// ---- Mute (or unmute) a participant's microphone at the source ----
+// Body: { room, identity, muted }  where identity is the participant's LiveKit
+// identity (their username) and muted is a boolean.
+//
+// This is the real echo fix for same-room use: the host (whose app calls this)
+// asks the server to mute a joiner's PUBLISHED audio track so that joiner stops
+// transmitting entirely. Because it's done server-side via RoomService, it
+// mutes the joiner for EVERYONE, killing the speaker->mic feedback loop at its
+// origin. Unmute (muted:false) restores their mic.
+//
+// We find the participant's audio track SID from the server's live view of the
+// room, then call mutePublishedTrack. If the participant has no audio track yet
+// (e.g. still connecting), we return ok with a note rather than erroring, so
+// the host's toggle never appears to "fail" for a transient timing reason.
+app.post('/mute-participant', async (req, res) => {
+  try {
+    const { room, identity, muted } = req.body || {};
+    if (!room || !identity || typeof muted !== 'boolean') {
+      return res
+        .status(400)
+        .json({ error: 'room, identity, and muted (boolean) are required' });
+    }
+
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+    if (!apiKey || !apiSecret) {
+      return res.status(500).json({ error: 'Server missing LiveKit credentials' });
+    }
+
+    const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+
+    // Look up the participant and their audio track from the live room state.
+    let participant;
+    try {
+      participant = await svc.getParticipant(room, identity);
+    } catch (lookupErr) {
+      // Participant not found (maybe already left). Not a hard error for the
+      // host's toggle — just report it couldn't be applied.
+      console.log(
+        `Mute lookup note for ${identity} in ${room}:`,
+        lookupErr?.message || lookupErr
+      );
+      return res.json({ ok: true, applied: false, reason: 'participant not found' });
+    }
+
+    const tracks = participant?.tracks || [];
+    // Audio track type is 1 (TrackType.AUDIO) in the LiveKit protocol. We match
+    // on the string/number defensively since the SDK may surface either.
+    const audioTrack = tracks.find(
+      (t) => t.type === 1 || t.type === 'AUDIO' || t.type === 'audio'
+    );
+
+    if (!audioTrack) {
+      // No audio track published yet — nothing to mute this instant. When the
+      // track appears, the host can toggle again, or a fresh join re-triggers.
+      return res.json({ ok: true, applied: false, reason: 'no audio track yet' });
+    }
+
+    await svc.mutePublishedTrack(room, identity, audioTrack.sid, muted);
+
+    res.json({ ok: true, applied: true, muted: muted });
+  } catch (err) {
+    console.error('Mute participant error:', err);
+    res.status(500).json({ error: 'Failed to mute participant' });
+  }
+});
+
 // ---- Start recording (Participant Egress -> R2) ----
 // CHANGED: this now records ONE participant's own feed, not the whole room.
 // The app sends { room, username } where username is the person who tapped
