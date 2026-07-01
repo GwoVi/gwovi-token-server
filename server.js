@@ -270,10 +270,20 @@ app.post('/mute-participant', async (req, res) => {
     }
 
     const tracks = participant?.tracks || [];
-    // Audio track type is 1 (TrackType.AUDIO) in the LiveKit protocol. We match
-    // on the string/number defensively since the SDK may surface either.
+    // Find the AUDIO track. In the LiveKit protocol TrackType.AUDIO === 0 and
+    // TrackType.VIDEO === 1, so we must match 0 here — matching 1 would grab
+    // the VIDEO track and muting that freezes the participant's camera on a
+    // stuck frame (which is exactly the bug we're fixing). We also match on the
+    // string forms and on source === microphone defensively, in case the SDK
+    // surfaces the type differently across versions.
     const audioTrack = tracks.find(
-      (t) => t.type === 1 || t.type === 'AUDIO' || t.type === 'audio'
+      (t) =>
+        t.type === 0 ||
+        t.type === 'AUDIO' ||
+        t.type === 'audio' ||
+        t.source === 2 ||          // TrackSource.MICROPHONE
+        t.source === 'MICROPHONE' ||
+        t.source === 'microphone'
     );
 
     if (!audioTrack) {
