@@ -46,6 +46,13 @@ const requests = {}; // requests[room] = { [username]: {status, ts} }
 // ---- In-memory event names (host sets when going live) ----
 const eventNames = {}; // eventNames[room] = "Baby shower"
 
+// ---- In-memory host identity per room ----
+// The host's LiveKit identity (their username). We capture it when the host
+// sets the event (goes live). Needed so that, in Nearby mode, a joiner's
+// recording can be composited with the HOST's audio track (the host is the
+// one participant left unmuted, so their voice is the shared audio).
+const hostNames = {}; // hostNames[room] = "Joseph"
+
 // ---- In-memory Nearby mode flag (host toggles when everyone's in one room) ----
 // When ON for a room, the app mutes every joiner's mic at the source to kill
 // the speaker->mic echo loop, and joiners' mics stay host-controlled. The
@@ -64,6 +71,32 @@ const recordings = {}; // recordings[room][username] = egressId
 function roomRecordings(room) {
   if (!recordings[room]) recordings[room] = {};
   return recordings[room];
+}
+
+// Looks up a participant's published track SIDs (audio + video) from the live
+// room state via RoomService. Returns { audioSid, videoSid } (either may be
+// undefined if that track isn't published yet). Used for composite recordings
+// where we pair a joiner's video with the host's audio in Nearby mode.
+// TrackType in the LiveKit protocol: AUDIO === 0, VIDEO === 1.
+async function getParticipantTrackSids(svc, room, identity) {
+  const result = { audioSid: undefined, videoSid: undefined };
+  try {
+    const p = await svc.getParticipant(room, identity);
+    const tracks = p?.tracks || [];
+    for (const t of tracks) {
+      const isAudio =
+        t.type === 0 || t.type === 'AUDIO' || t.type === 'audio' ||
+        t.source === 2 || t.source === 'MICROPHONE' || t.source === 'microphone';
+      const isVideo =
+        t.type === 1 || t.type === 'VIDEO' || t.type === 'video' ||
+        t.source === 1 || t.source === 'CAMERA' || t.source === 'camera';
+      if (isAudio && !result.audioSid) result.audioSid = t.sid;
+      if (isVideo && !result.videoSid) result.videoSid = t.sid;
+    }
+  } catch (e) {
+    console.log(`Track lookup note for ${identity} in ${room}:`, e?.message || e);
+  }
+  return result;
 }
 
 function roomRequests(room) {
@@ -394,21 +427,67 @@ app.post('/start-recording', async (req, res) => {
       videoCodec: 0,      // H.264 baseline default for broad compatibility
     });
 
-    // Participant Egress records just this one participant's published feed.
-    // The participant is identified by their LiveKit identity, which we set to
-    // the username when minting their token (see /token above).
-    const info = await egressClient.startParticipantEgress(
-      room,
-      username,
-      {
-        file: fileOutput,
-        encodingOptions: encoding,
+    // Decide which kind of recording to start.
+    //
+    // NORMAL (Nearby off, OR the recorder is the host): record this one
+    // participant's own feed (their video + their own audio) via Participant
+    // Egress — exactly as before.
+    //
+    // NEARBY ON + recorder is a JOINER: the joiner's mic is muted to stop echo,
+    // so their own audio is silent. Instead we composite the joiner's VIDEO
+    // with the HOST's AUDIO (the host is the one unmuted voice), producing a
+    // recording that has sound. This is done via Track Composite Egress.
+    const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+    const nearbyOn = nearbyModes[room] === true;
+    const hostIdentity = hostNames[room];
+    const recorderIsHost =
+      hostIdentity && hostIdentity === username;
+
+    let info;
+    let usedComposite = false;
+
+    if (nearbyOn && !recorderIsHost && hostIdentity) {
+      // Look up the joiner's video track and the host's audio track.
+      const joinerTracks = await getParticipantTrackSids(svc, room, username);
+      const hostTracks = await getParticipantTrackSids(svc, room, hostIdentity);
+
+      if (joinerTracks.videoSid && hostTracks.audioSid) {
+        // Track Composite: joiner video + host audio -> single MP4.
+        info = await egressClient.startTrackCompositeEgress(
+          room,
+          {
+            file: fileOutput,
+            encodingOptions: encoding,
+          },
+          {
+            audioTrackId: hostTracks.audioSid,
+            videoTrackId: joinerTracks.videoSid,
+          }
+        );
+        usedComposite = true;
       }
-    );
+    }
+
+    if (!info) {
+      // Fallback / normal path: record the recorder's own participant feed.
+      info = await egressClient.startParticipantEgress(
+        room,
+        username,
+        {
+          file: fileOutput,
+          encodingOptions: encoding,
+        }
+      );
+    }
 
     roomRecs[username] = info.egressId;
 
-    res.json({ ok: true, egressId: info.egressId, filepath: filepath });
+    res.json({
+      ok: true,
+      egressId: info.egressId,
+      filepath: filepath,
+      composite: usedComposite,
+    });
   } catch (err) {
     console.error('Start recording error:', err);
     res.status(500).json({ error: 'Failed to start recording' });
@@ -601,7 +680,7 @@ app.post('/delete-recording', async (req, res) => {
 
 // ---- Host: register (or clear) the event name for a room ----
 app.post('/setevent', (req, res) => {
-  const { room, event } = req.body || {};
+  const { room, event, host } = req.body || {};
   if (!room) {
     return res.status(400).json({ error: 'room is required' });
   }
@@ -609,12 +688,18 @@ app.post('/setevent', (req, res) => {
   const apiSecret = process.env.LIVEKIT_API_SECRET;
   if (event && event.length > 0) {
     eventNames[room] = event;
+    // Remember who the host is (their LiveKit identity) for composite
+    // recordings in Nearby mode. The app sends this when the host goes live.
+    if (host && String(host).trim().length > 0) {
+      hostNames[room] = String(host).trim();
+    }
     // Host just went live -> start the free-tier session countdown.
     if (apiKey && apiSecret) {
       startSessionTimer(room, apiKey, apiSecret);
     }
   } else {
     delete eventNames[room];
+    delete hostNames[room];
     // Host cleared the event (left) -> cancel the countdown.
     clearSessionTimer(room);
     // Also clear any leftover recording entries for this room so a fresh
