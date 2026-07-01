@@ -46,6 +46,15 @@ const requests = {}; // requests[room] = { [username]: {status, ts} }
 // ---- In-memory event names (host sets when going live) ----
 const eventNames = {}; // eventNames[room] = "Baby shower"
 
+// ---- In-memory Nearby mode flag (host toggles when everyone's in one room) ----
+// When ON for a room, the app mutes every joiner's mic at the source to kill
+// the speaker->mic echo loop, and joiners' mics stay host-controlled. The
+// server just remembers the on/off state per room so newly-arriving joiners
+// can be muted on entry too. The actual muting is performed by the host app
+// via its room-admin token (see /token below); this flag is the shared
+// source of truth the app reads.
+const nearbyModes = {}; // nearbyModes[room] = true | false
+
 // ---- In-memory active recordings ----
 // CHANGED: each person now records their OWN feed independently, so we track
 // one egressId PER username inside each room instead of a single egressId for
@@ -89,6 +98,7 @@ function startSessionTimer(room, apiKey, apiSecret) {
     }
     delete sessionTimers[room];
     delete recordings[room];
+    delete nearbyModes[room];
   }, SESSION_LIMIT_MS);
 }
 
@@ -132,9 +142,13 @@ app.get('/', (req, res) => {
 });
 
 // ---- Token minting ----
+// CHANGED: now accepts an optional { isHost } flag. When isHost is true, the
+// token additionally carries roomAdmin permission, which is what lets the
+// host app mute other participants' mics (Nearby mode). Joiners get the exact
+// same grant as before (no roomAdmin), so their join path is unchanged.
 app.post('/token', async (req, res) => {
   try {
-    const { username, room } = req.body || {};
+    const { username, room, isHost } = req.body || {};
     if (!username || !room) {
       return res.status(400).json({ error: 'username and room are required' });
     }
@@ -160,13 +174,25 @@ app.post('/token', async (req, res) => {
       name: username,
       ttl: '6h',
     });
-    at.addGrant({
+
+    // Base grant — identical for host and joiner. This is exactly what every
+    // participant received before, so the joiner path is untouched.
+    const grant = {
       roomJoin: true,
       room: room,
       canPublish: true,
       canSubscribe: true,
       canUpdateOwnMetadata: true,
-    });
+    };
+
+    // HOST ONLY: roomAdmin lets this participant mute other participants'
+    // tracks (the LiveKit admin mute used by Nearby mode). Only the host ever
+    // receives this; joiners never do.
+    if (isHost === true) {
+      grant.roomAdmin = true;
+    }
+
+    at.addGrant(grant);
 
     const token = await at.toJwt();
     res.json({ token });
@@ -174,6 +200,28 @@ app.post('/token', async (req, res) => {
     console.error('Token error:', err);
     res.status(500).json({ error: 'Failed to create token' });
   }
+});
+
+// ---- Nearby mode: host sets on/off for a room ----
+// Body: { room, on }  (on is boolean). The app reads this so newly-arriving
+// joiners know whether they should come in muted. The host app performs the
+// actual admin-mute of existing participants directly via LiveKit.
+app.post('/set-nearby', (req, res) => {
+  const { room, on } = req.body || {};
+  if (!room) {
+    return res.status(400).json({ error: 'room is required' });
+  }
+  nearbyModes[room] = on === true;
+  res.json({ ok: true, on: nearbyModes[room] });
+});
+
+// ---- Nearby mode: read on/off for a room ----
+app.get('/nearby', (req, res) => {
+  const room = req.query.room;
+  if (!room) {
+    return res.status(400).json({ error: 'room is required' });
+  }
+  res.json({ on: nearbyModes[room] === true });
 });
 
 // ---- Start recording (Participant Egress -> R2) ----
@@ -495,6 +543,8 @@ app.post('/setevent', (req, res) => {
     // Also clear any leftover recording entries for this room so a fresh
     // session never inherits a stale "already recording" block.
     delete recordings[room];
+    // Clear Nearby mode too, so a fresh session starts in normal mode.
+    delete nearbyModes[room];
   }
   res.json({ ok: true });
 });
