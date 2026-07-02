@@ -174,6 +174,39 @@ app.get('/', (req, res) => {
   res.send('GwoVi token server is running.');
 });
 
+// ---- Force-end a room (manual kill switch) ----
+// GET so it can be triggered from a browser:
+//   https://.../end-room?room=test-room
+// Deletes the LiveKit room (disconnecting everyone) and clears all in-memory
+// state for it. Use this to kill a stuck/persistent session. Safe to call even
+// if the room doesn't exist.
+app.get('/end-room', async (req, res) => {
+  const room = req.query.room;
+  if (!room) {
+    return res.status(400).json({ error: 'room is required' });
+  }
+  const apiKey = process.env.LIVEKIT_API_KEY;
+  const apiSecret = process.env.LIVEKIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    return res.status(500).json({ error: 'Server missing LiveKit credentials' });
+  }
+  try {
+    const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+    await svc.deleteRoom(room);
+  } catch (e) {
+    // If the room is already gone, that's fine — we still clear state below.
+    console.log('end-room note:', e?.message || e);
+  }
+  // Clear all in-memory state so nothing lingers.
+  clearSessionTimer(room);
+  delete eventNames[room];
+  delete hostNames[room];
+  delete nearbyModes[room];
+  delete recordings[room];
+  delete requests[room];
+  res.json({ ok: true, room: room, ended: true });
+});
+
 // ---- Token minting ----
 // CHANGED: now accepts an optional { isHost } flag. When isHost is true, the
 // token additionally carries roomAdmin permission, which is what lets the
