@@ -60,7 +60,7 @@ const hostNames = {}; // hostNames[room] = "Joseph"
 // can be muted on entry too. The actual muting is performed by the host app
 // via its room-admin token (see /token below); this flag is the shared
 // source of truth the app reads.
-const nearbyModes = {}; // nearbyModes[room] = true | false
+const nearbyModes = {}; // nearbyModes[room] = 'off' | 'soft' | 'hard'
 
 // ---- In-memory active recordings ----
 // CHANGED: each person now records their OWN feed independently, so we track
@@ -239,22 +239,40 @@ app.post('/token', async (req, res) => {
 // Body: { room, on }  (on is boolean). The app reads this so newly-arriving
 // joiners know whether they should come in muted. The host app performs the
 // actual admin-mute of existing participants directly via LiveKit.
+//
+// THREE-STATE: mode is 'off' | 'soft' | 'hard'.
+//   off  = normal, nobody muted.
+//   soft = joiner mic+speaker muted for echo, but joiner MAY override (re-enable
+//          their own) if they've walked out of the echo zone.
+//   hard = joiner mic+speaker forced off, no override.
+// We accept either { mode } (new) or { on } (legacy boolean, true -> 'hard')
+// so an older app build can't wedge the flag. We also return both `mode` and a
+// legacy `on` (true when mode !== 'off') for backward compatibility.
 app.post('/set-nearby', (req, res) => {
-  const { room, on } = req.body || {};
+  const { room, mode, on } = req.body || {};
   if (!room) {
     return res.status(400).json({ error: 'room is required' });
   }
-  nearbyModes[room] = on === true;
-  res.json({ ok: true, on: nearbyModes[room] });
+  let next;
+  if (mode === 'off' || mode === 'soft' || mode === 'hard') {
+    next = mode;
+  } else if (typeof on === 'boolean') {
+    next = on ? 'hard' : 'off';   // legacy boolean support
+  } else {
+    next = 'off';
+  }
+  nearbyModes[room] = next;
+  res.json({ ok: true, mode: next, on: next !== 'off' });
 });
 
-// ---- Nearby mode: read on/off for a room ----
+// ---- Nearby mode: read state for a room ----
 app.get('/nearby', (req, res) => {
   const room = req.query.room;
   if (!room) {
     return res.status(400).json({ error: 'room is required' });
   }
-  res.json({ on: nearbyModes[room] === true });
+  const mode = nearbyModes[room] || 'off';
+  res.json({ mode: mode, on: mode !== 'off' });
 });
 
 // ---- Mute (or unmute) a participant's microphone at the source ----
@@ -440,12 +458,17 @@ app.post('/start-recording', async (req, res) => {
     // participant's own feed (their video + their own audio) via Participant
     // Egress — exactly as before.
     //
-    // NEARBY ON + recorder is a JOINER: the joiner's mic is muted to stop echo,
-    // so their own audio is silent. Instead we composite the joiner's VIDEO
-    // with the HOST's AUDIO (the host is the one unmuted voice), producing a
-    // recording that has sound. This is done via Track Composite Egress.
+    // NEARBY (soft or hard) + recorder is a JOINER whose mic is actually
+    // muted: the joiner's own audio is silent, so we composite the joiner's
+    // VIDEO with the HOST's AUDIO (the one unmuted voice) via Track Composite
+    // Egress. In SOFT mode a joiner may have overridden and turned their own
+    // mic back on (they walked out of the echo zone) — in that case their mic
+    // is live, so we record their OWN feed normally. We decide by checking the
+    // joiner's actual audio-track mute state at record-start (no mid-recording
+    // swap), which is exactly the rule we want.
     const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
-    const nearbyOn = nearbyModes[room] === true;
+    const nearbyMode = nearbyModes[room] || 'off';
+    const nearbyActive = nearbyMode === 'soft' || nearbyMode === 'hard';
     const hostIdentity = hostNames[room];
     const recorderIsHost =
       hostIdentity && hostIdentity === username;
@@ -453,12 +476,27 @@ app.post('/start-recording', async (req, res) => {
     let info;
     let usedComposite = false;
 
-    if (nearbyOn && !recorderIsHost && hostIdentity) {
-      // Look up the joiner's video track and the host's audio track.
+    if (nearbyActive && !recorderIsHost && hostIdentity) {
+      // Look up the joiner's video + audio tracks and the host's audio track.
       const joinerTracks = await getParticipantTrackSids(svc, room, username);
       const hostTracks = await getParticipantTrackSids(svc, room, hostIdentity);
 
-      if (joinerTracks.videoSid && hostTracks.audioSid) {
+      // Is the joiner's mic actually muted right now? If they overrode in soft
+      // mode, it's live and we should record their own audio instead.
+      let joinerMicMuted = false;
+      try {
+        const jp = await svc.getParticipant(room, username);
+        const jAudio = (jp?.tracks || []).find(
+          (t) => t.type === 0 || t.type === 'AUDIO' || t.type === 'audio' ||
+                 t.source === 2 || t.source === 'MICROPHONE' || t.source === 'microphone'
+        );
+        joinerMicMuted = jAudio ? (jAudio.muted === true) : true;
+      } catch (e) {
+        // If we can't tell, assume muted (safer: recording still gets host audio).
+        joinerMicMuted = true;
+      }
+
+      if (joinerMicMuted && joinerTracks.videoSid && hostTracks.audioSid) {
         // Track Composite: joiner video + host audio -> single MP4.
         info = await egressClient.startTrackCompositeEgress(
           room,
