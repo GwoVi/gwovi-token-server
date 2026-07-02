@@ -645,8 +645,12 @@ app.get('/recordings', async (req, res) => {
 
 // ---- Upload a snapshot image (captured on-device) to R2 ----
 // Body: { room, event, image }  where image is base64 JPEG (no data: prefix).
-// Stored as {room}/{EventName}__{timestamp}.jpg so it appears in the gallery
-// alongside videos and is covered by the same 24h auto-delete lifecycle rule.
+// Stored as {room}/{EventName}__Snap__{Host}__{msTimestamp}.jpg — the SAME
+// 4-part shape as video recordings (Event__Username__Host__timestamp), so the
+// gallery's host-based delete rule applies to photos too. The "Snap"
+// placeholder fills the username slot (a snapshot isn't tied to one feed's
+// user), and the host is looked up from hostNames[room] so only the session
+// host can delete it. Covered by the same 24h auto-delete lifecycle rule.
 app.post('/upload-snapshot', async (req, res) => {
   try {
     const { room, event, image } = req.body || {};
@@ -666,11 +670,15 @@ app.post('/upload-snapshot', async (req, res) => {
       return res.status(400).json({ error: 'image could not be decoded' });
     }
 
-    // Same naming convention as recordings: {room}/{EventName}__{timestamp}.jpg
-    const safeEvent = (event && String(event).trim()) || 'GwoVi';
-    const namePart = safeEvent.replace(/[^a-zA-Z0-9-_ ]/g, '').trim() || 'GwoVi';
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const key = `${room}/${namePart}__${stamp}.jpg`;
+    // 4-part name matching videos: {room}/{Event}__Snap__{Host}__{stamp}.jpg
+    // Use a millisecond timestamp (not ISO) so the gallery parses the date the
+    // same way it does for videos (Double(lastSegment) / 1000).
+    const safeEvent = safeToken((event || '').trim(), 60);
+    const safeHost = safeToken((hostNames[room] || '').trim(), 40);
+    const eventPart = safeEvent.length > 0 ? safeEvent : 'GwoVi';
+    const hostPart = safeHost.length > 0 ? safeHost : 'host';
+    const stamp = Date.now();
+    const key = `${room}/${eventPart}__Snap__${hostPart}__${stamp}.jpg`;
 
     await s3.send(
       new PutObjectCommand({
