@@ -388,17 +388,24 @@ app.post('/start-recording', async (req, res) => {
       delete roomRecs[username];
     }
 
-    // Build the filename so the event name AND the username ride along with the
-    // file. The gallery parses the event name back out to show "Event name" +
-    // date; the username makes each participant's file identifiable.
-    // Format: {room}/{EventName}__{Username}__{timestamp}.mp4
-    // The double underscore "__" is the separator the app looks for.
+    // Build the filename so the event name, the RECORDER's username, and the
+    // session HOST's name all ride along with the file. The gallery parses:
+    //   - event name  -> shown as the title
+    //   - username    -> whose feed this is (shown in details)
+    //   - host        -> who may DELETE this video (host-of-this-session only)
+    // Format: {room}/{EventName}__{Username}__{Host}__{timestamp}.mp4
+    // The double underscore "__" is the separator the app looks for. Timestamp
+    // stays LAST so date parsing is unaffected. Older 3-part names
+    // (Event__Username__timestamp) still parse (no host segment -> not
+    // deletable by anyone, safe default).
     const stamp = Date.now();
     const safeEvent = safeToken((eventNames[room] || '').trim(), 60);
     const safeUser = safeToken(username, 40);
+    const safeHost = safeToken((hostNames[room] || '').trim(), 40);
     const eventPart = safeEvent.length > 0 ? safeEvent : room;
     const userPart = safeUser.length > 0 ? safeUser : 'user';
-    const filepath = `${room}/${eventPart}__${userPart}__${stamp}.mp4`;
+    const hostPart = safeHost.length > 0 ? safeHost : 'host';
+    const filepath = `${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
 
     const fileOutput = new EncodedFileOutput({
       fileType: EncodedFileType.MP4,
