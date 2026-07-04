@@ -8,6 +8,7 @@ import {
   EncodedFileType,
   EncodingOptions,
   S3Upload,
+  WebhookReceiver,
 } from 'livekit-server-sdk';
 import {
   S3Client,
@@ -20,7 +21,119 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const app = express();
 app.use(cors());
+
+// ---- LiveKit webhook receiver ----
+// LiveKit signs each webhook request with the project's API key/secret. The
+// WebhookReceiver verifies that signature so we KNOW a teardown request really
+// came from LiveKit (and not a random POST to our public URL). Created once
+// here and reused by the /livekit-webhook route below.
+//
+// IMPORTANT: the webhook route is registered a few lines down, BEFORE the
+// global express.json() parser, because LiveKit signs the RAW request body.
+// If express.json() consumed the body first, signature verification would fail.
+const webhookReceiver = new WebhookReceiver(
+  process.env.LIVEKIT_API_KEY,
+  process.env.LIVEKIT_API_SECRET
+);
+
+// ---- Force-end a room's in-memory state (shared cleanup) ----
+// Clears every piece of in-memory state we track for a room, plus any pending
+// session timer. Used by BOTH the manual /end-room kill switch and the
+// automatic /livekit-webhook teardown, so the two can never drift apart.
+// Note: this does NOT call deleteRoom — callers decide whether the LiveKit
+// room still needs deleting (the webhook path doesn't, since LiveKit already
+// finished the room; the manual path does).
+function clearRoomState(room) {
+  clearSessionTimer(room);
+  delete eventNames[room];
+  delete hostNames[room];
+  delete nearbyModes[room];
+  delete recordings[room];
+  delete requests[room];
+  delete sessionTimers[room];
+}
+
+// Stops any Egress recordings we still have tracked for a room. Best-effort:
+// a failed stop almost always means that Egress already ended on its own, so
+// we log and move on. Used by the webhook teardown so a room ending doesn't
+// leave orphaned recordings running (which would burn Egress minutes).
+async function stopRoomRecordings(room, apiKey, apiSecret) {
+  const recs = recordings[room];
+  if (!recs) return;
+  const ids = Object.values(recs);
+  if (ids.length === 0) return;
+  try {
+    const egressClient = new EgressClient(LIVEKIT_HOST, apiKey, apiSecret);
+    for (const egressId of ids) {
+      try {
+        await egressClient.stopEgress(egressId);
+        console.log(`Webhook teardown: stopped egress ${egressId} in ${room}`);
+      } catch (e) {
+        console.log(
+          `Webhook teardown: egress ${egressId} stop note:`,
+          e?.message || e
+        );
+      }
+    }
+  } catch (e) {
+    console.log('Webhook teardown: egress client note:', e?.message || e);
+  }
+}
+
+// ---- LiveKit webhook endpoint (AUTO session teardown) ----
+// LiveKit POSTs here when room events happen (we subscribed to room_finished
+// in the LiveKit Cloud dashboard). When a room FINISHES — which LiveKit fires
+// after the room empties out past its empty-timeout, or when a room is deleted
+// — we clear all our in-memory state for it and stop any lingering recordings.
+// This is the reliable auto-end that a solo/Home session (which never arms the
+// in-memory session timer) previously lacked, and it survives Render redeploys
+// because it doesn't depend on any in-memory timer being alive.
+//
+// This route MUST be registered before app.use(express.json()) and use a raw
+// body parser, because the signature is computed over the raw bytes.
+app.post(
+  '/livekit-webhook',
+  express.raw({ type: '*/*' }),
+  async (req, res) => {
+    try {
+      // req.body is a Buffer here (raw parser). The receiver needs the raw
+      // string body plus the Authorization header to verify the signature.
+      const event = await webhookReceiver.receive(
+        req.body.toString('utf8'),
+        req.get('Authorization')
+      );
+
+      // We only act on room_finished. Every other event (participant joined/
+      // left, track published, egress updates, etc.) is acknowledged and
+      // ignored so LiveKit doesn't retry it.
+      if (event?.event === 'room_finished') {
+        const room = event?.room?.name;
+        if (room) {
+          console.log(`Webhook: room_finished for ${room} — tearing down.`);
+          const apiKey = process.env.LIVEKIT_API_KEY;
+          const apiSecret = process.env.LIVEKIT_API_SECRET;
+          if (apiKey && apiSecret) {
+            await stopRoomRecordings(room, apiKey, apiSecret);
+          }
+          clearRoomState(room);
+        }
+      }
+
+      // Always 200 so LiveKit marks the delivery successful.
+      res.status(200).json({ ok: true });
+    } catch (err) {
+      // A verification failure (bad/forged signature) or any parsing error
+      // lands here. Respond 200 anyway so LiveKit doesn't hammer us with
+      // retries for something we can't process; we just log it.
+      console.log('Webhook receive note:', err?.message || err);
+      res.status(200).json({ ok: false });
+    }
+  }
+);
+
 // Raised limit so base64-encoded snapshot images fit in the JSON body.
+// NOTE: this JSON parser is registered AFTER the webhook route above, so it
+// never touches the webhook's raw body.
 app.use(express.json({ limit: '15mb' }));
 
 // ---- Free-tier limits ----
@@ -34,7 +147,9 @@ const SESSION_LIMIT_MS = 10 * 60 * 1000; // 10 minutes
 // Tracks the auto-end timer for each room so we can clear it if the room
 // ends early. Note: timers live in memory, so a server restart (e.g. a
 // Render redeploy) clears any pending timer. Acceptable for a soft free-tier
-// limit; revisit if we ever need hard billing enforcement.
+// limit; revisit if we ever need hard billing enforcement. The webhook
+// teardown above does NOT depend on these timers, so it works even after a
+// redeploy wipes them.
 const sessionTimers = {}; // sessionTimers[room] = Timeout
 
 // Your LiveKit project's HTTPS host (wss:// URL with https:// instead).
@@ -179,7 +294,8 @@ app.get('/', (req, res) => {
 //   https://.../end-room?room=test-room
 // Deletes the LiveKit room (disconnecting everyone) and clears all in-memory
 // state for it. Use this to kill a stuck/persistent session. Safe to call even
-// if the room doesn't exist.
+// if the room doesn't exist. (The automatic /livekit-webhook teardown now
+// handles the normal empty-room case; this stays as a manual override.)
 app.get('/end-room', async (req, res) => {
   const room = req.query.room;
   if (!room) {
@@ -197,13 +313,8 @@ app.get('/end-room', async (req, res) => {
     // If the room is already gone, that's fine — we still clear state below.
     console.log('end-room note:', e?.message || e);
   }
-  // Clear all in-memory state so nothing lingers.
-  clearSessionTimer(room);
-  delete eventNames[room];
-  delete hostNames[room];
-  delete nearbyModes[room];
-  delete recordings[room];
-  delete requests[room];
+  // Clear all in-memory state so nothing lingers (shared with webhook teardown).
+  clearRoomState(room);
   res.json({ ok: true, room: room, ended: true });
 });
 
