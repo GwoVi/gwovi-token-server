@@ -448,6 +448,27 @@ app.post('/mute-participant', async (req, res) => {
       return res.status(500).json({ error: 'Server missing LiveKit credentials' });
     }
 
+    // MUTE-ONLY POLICY (privacy-clean echo control):
+    // LiveKit disallows server-side REMOTE UNMUTE by default (it returns a 412
+    // "remote unmute not enabled" for privacy reasons). Rather than enable that
+    // privacy-weakening setting, this server never remote-unmutes anyone. The
+    // server only ever MUTES a joiner at the source (echo control). Restoring a
+    // joiner's mic is done by the joiner's OWN app calling setMicrophone(true)
+    // on its own local participant — a participant unmuting THEMSELVES is always
+    // allowed and never triggers the 412. So here, an unmute request (muted =
+    // false) is acknowledged as a no-op success; only muted = true reaches
+    // LiveKit. This is what fixes the silent-joiner-recording bug: previously
+    // the host cycling Nearby to OFF sent muted:false, LiveKit rejected it with
+    // 412, the joiner stayed muted at the source, and their next recording came
+    // out silent.
+    if (muted === false) {
+      return res.json({
+        ok: true,
+        applied: false,
+        reason: 'unmute is handled by the participant themselves (server is mute-only)',
+      });
+    }
+
     const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
 
     // Look up the participant and their audio track from the live room state.
