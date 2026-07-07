@@ -661,20 +661,47 @@ app.post('/start-recording', async (req, res) => {
         joinerMicMuted = true;
       }
 
+      // DIAGNOSTIC: log exactly what the composite decision sees. If the joiner
+      // recording is coming out silent while muted, this line shows why: e.g. a
+      // missing hostAudioSid (host mic not publishing / host identity wrong)
+      // makes the composite condition fail and we fall through to the normal
+      // path, which records the joiner's own (muted) mic = silence.
+      console.log(
+        `[record-decision] room=${room} recorder=${username} nearby=${nearbyMode} ` +
+        `hostIdentity=${hostIdentity} joinerMicMuted=${joinerMicMuted} ` +
+        `joinerVideoSid=${joinerTracks.videoSid || 'NONE'} ` +
+        `hostAudioSid=${hostTracks.audioSid || 'NONE'}`
+      );
+
       if (joinerMicMuted && joinerTracks.videoSid && hostTracks.audioSid) {
         // Track Composite: joiner video + host audio -> single MP4.
-        info = await egressClient.startTrackCompositeEgress(
-          room,
-          {
-            file: fileOutput,
-            encodingOptions: encoding,
-          },
-          {
-            audioTrackId: hostTracks.audioSid,
-            videoTrackId: joinerTracks.videoSid,
-          }
+        try {
+          info = await egressClient.startTrackCompositeEgress(
+            room,
+            {
+              file: fileOutput,
+              encodingOptions: encoding,
+            },
+            {
+              audioTrackId: hostTracks.audioSid,
+              videoTrackId: joinerTracks.videoSid,
+            }
+          );
+          usedComposite = true;
+          console.log(
+            `[record-decision] started COMPOSITE egress ${info.egressId} ` +
+            `(joiner video ${joinerTracks.videoSid} + host audio ${hostTracks.audioSid})`
+          );
+        } catch (compErr) {
+          // If the composite call fails, log it loudly and fall through to the
+          // normal participant egress so at least SOMETHING records.
+          console.error('[record-decision] COMPOSITE egress failed:', compErr);
+        }
+      } else {
+        console.log(
+          `[record-decision] composite condition NOT met -> falling back to ` +
+          `normal participant egress (recording will use joiner's own mic)`
         );
-        usedComposite = true;
       }
     }
 
