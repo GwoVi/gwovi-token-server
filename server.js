@@ -279,9 +279,18 @@ function pruneOld(room) {
   }
 }
 
-// Arms the free-tier session timer for a room. After SESSION_LIMIT_MS, the
-// room is deleted, which disconnects everyone. Clears any existing timer for
-// the room first so we don't stack them.
+// Arms the "abandoned room" cleanup timer for a room. Its ONLY job is to clean
+// up rooms nobody is using anymore (free-tier cost protection). After
+// SESSION_LIMIT_MS it CHECKS whether anyone is still connected:
+//   - If the room is EMPTY (or gone), it deletes it and clears state.
+//   - If people are STILL CONNECTED, it does NOT kill the live session — it
+//     reschedules the check for another SESSION_LIMIT_MS later.
+// This fixes the core bug behind silent recordings and dropped sessions: the
+// old timer deleted the room after 10 minutes no matter what, which tore down
+// ACTIVE sessions mid-use. Every teardown wiped Nearby mode + host identity and
+// forced phones to reconnect, which reset the joiner's mic and broke the audio
+// composite. By only cleaning up genuinely empty rooms, an in-use session (and
+// all its Nearby/mute state) now survives as long as people are actually in it.
 function startSessionTimer(room, apiKey, apiSecret) {
   if (sessionTimers[room]) {
     clearTimeout(sessionTimers[room]);
@@ -289,14 +298,41 @@ function startSessionTimer(room, apiKey, apiSecret) {
   sessionTimers[room] = setTimeout(async () => {
     try {
       const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+
+      // Check whether anyone is still in the room before killing it.
+      let activeCount = 0;
+      try {
+        const participants = await svc.listParticipants(room);
+        activeCount = Array.isArray(participants) ? participants.length : 0;
+      } catch (e) {
+        // If the room doesn't exist / can't be listed, treat as empty.
+        activeCount = 0;
+      }
+
+      if (activeCount > 0) {
+        // Room is still in active use — do NOT tear it down. Reschedule the
+        // abandoned-room check for later so we revisit once this window passes.
+        console.log(
+          `Session check: ${room} still has ${activeCount} participant(s) — ` +
+          `keeping it alive, rescheduling cleanup.`
+        );
+        delete sessionTimers[room];
+        startSessionTimer(room, apiKey, apiSecret); // re-arm for another window
+        return;
+      }
+
+      // Room is empty — safe to clean up (free-tier cost protection).
       await svc.deleteRoom(room);
-      console.log(`Session limit reached: ended room ${room}`);
+      console.log(`Session cleanup: ended EMPTY room ${room}`);
+      delete sessionTimers[room];
+      delete recordings[room];
+      delete nearbyModes[room];
     } catch (e) {
       console.log('Session auto-end note:', e?.message || e);
+      delete sessionTimers[room];
+      delete recordings[room];
+      delete nearbyModes[room];
     }
-    delete sessionTimers[room];
-    delete recordings[room];
-    delete nearbyModes[room];
   }, SESSION_LIMIT_MS);
 }
 
