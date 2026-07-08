@@ -691,32 +691,50 @@ app.post('/start-recording', async (req, res) => {
     // swap), which is exactly the rule we want.
     const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
     const nearbyMode = nearbyModes[room] || 'off';
-    const nearbyActive = nearbyMode === 'soft' || nearbyMode === 'hard';
     const hostIdentity = hostNames[room];
-    const recorderIsHost =
-      hostIdentity && hostIdentity === username;
 
     let info;
     let usedComposite = false;
 
-    if (nearbyActive && !recorderIsHost && hostIdentity) {
+    // Determine, from ACTUAL LIVE ROOM STATE, whether this recorder's own mic is
+    // muted at the source right now. This is the robust trigger for compositing
+    // host audio — and it deliberately does NOT depend on the in-memory
+    // nearbyModes[room] flag, which gets WIPED every time the shared room is torn
+    // down (session timer / room_finished webhook) and recreated. Relying on that
+    // flag caused silent recordings: the host muted the joiner (flag set), the
+    // room got torn down (flag wiped), the phones auto-reconnected, and by the
+    // time the joiner recorded the server thought Nearby was OFF -> no composite
+    // -> recorded the joiner's own muted mic -> silence. The joiner's real mic
+    // mute state survives all of that, so we key off it directly.
+    let recorderMicMuted = false;
+    try {
+      const rp = await svc.getParticipant(room, username);
+      const rAudio = (rp?.tracks || []).find(
+        (t) => t.type === 0 || t.type === 'AUDIO' || t.type === 'audio' ||
+               t.source === 2 || t.source === 'MICROPHONE' || t.source === 'microphone'
+      );
+      // Muted if the track exists and is muted, OR if there's no published mic
+      // track at all (nothing to record from this participant = effectively muted).
+      recorderMicMuted = rAudio ? (rAudio.muted === true) : true;
+    } catch (e) {
+      recorderMicMuted = false; // if we truly can't tell, don't force composite
+    }
+
+    // Is this recorder the host? The host records their own feed normally (they
+    // have live audio). We treat someone as "the muted joiner needing host audio"
+    // when their OWN mic is muted at the source. That covers soft/hard Nearby
+    // regardless of whether the in-memory flag survived a teardown.
+    const recorderIsHost = hostIdentity && hostIdentity === username;
+
+    // COMPOSITE TRIGGER: the recorder's own mic is muted (so recording their own
+    // feed would be silent), and they are not the host. We no longer require
+    // nearbyActive from the wipeable flag — the live mute state IS the signal.
+    if (recorderMicMuted && !recorderIsHost) {
       // Look up the joiner's video track (their own feed, which we always keep).
       const joinerTracks = await getParticipantTrackSids(svc, room, username);
 
-      // Is the joiner's mic actually muted right now? If they overrode in soft
-      // mode, it's live and we should record their own audio instead.
-      let joinerMicMuted = false;
-      try {
-        const jp = await svc.getParticipant(room, username);
-        const jAudio = (jp?.tracks || []).find(
-          (t) => t.type === 0 || t.type === 'AUDIO' || t.type === 'audio' ||
-                 t.source === 2 || t.source === 'MICROPHONE' || t.source === 'microphone'
-        );
-        joinerMicMuted = jAudio ? (jAudio.muted === true) : true;
-      } catch (e) {
-        // If we can't tell, assume muted (safer: recording still gets host audio).
-        joinerMicMuted = true;
-      }
+      // Keep joinerMicMuted for logging clarity (same as recorderMicMuted here).
+      const joinerMicMuted = recorderMicMuted;
 
       // FIND LIVE HOST AUDIO — the fix for silent joiner recordings.
       // Instead of blindly trusting hostNames[room] (which can go stale after a
@@ -733,8 +751,8 @@ app.post('/start-recording', async (req, res) => {
       // DIAGNOSTIC: log exactly what the composite decision sees, including the
       // live-audio result so a silent recording is immediately explainable.
       console.log(
-        `[record-decision] room=${room} recorder=${username} nearby=${nearbyMode} ` +
-        `storedHost=${hostIdentity} joinerMicMuted=${joinerMicMuted} ` +
+        `[record-decision] room=${room} recorder=${username} nearbyFlag=${nearbyMode} ` +
+        `recorderMicMuted=${joinerMicMuted} storedHost=${hostIdentity || 'NONE'} ` +
         `joinerVideoSid=${joinerTracks.videoSid || 'NONE'} ` +
         `liveAudioFrom=${liveAudio.identity || 'NONE'} ` +
         `liveAudioSid=${liveAudio.audioSid || 'NONE'}`
