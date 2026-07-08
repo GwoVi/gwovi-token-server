@@ -214,6 +214,56 @@ async function getParticipantTrackSids(svc, room, identity) {
   return result;
 }
 
+// Returns the SID of a LIVE, UNMUTED microphone audio track published by some
+// participant in the room OTHER than excludeIdentity (the muted joiner who is
+// recording). Also returns the identity that owns it.
+//
+// This is the fix for silent joiner recordings after solo/session reuse: the
+// stored hostNames[room] can go stale (point at a host who already left), so a
+// composite that trusts it grabs a dead track SID and records silence. Instead
+// of trusting stored state, we scan the room's ACTUAL current participants and
+// pick a real live voice to composite in. We prefer preferredIdentity (the
+// stored host) IF it's actually connected and unmuted; otherwise we fall back
+// to any other live unmuted speaker in the room.
+async function findLiveAudioPublisher(svc, room, excludeIdentity, preferredIdentity) {
+  try {
+    const participants = await svc.listParticipants(room);
+    const isLiveAudio = (t) => {
+      const isAudio =
+        t.type === 0 || t.type === 'AUDIO' || t.type === 'audio' ||
+        t.source === 2 || t.source === 'MICROPHONE' || t.source === 'microphone';
+      // A track that exists and is NOT muted = carrying live sound.
+      return isAudio && t.muted !== true;
+    };
+
+    // First pass: honor the preferred (stored host) identity, but ONLY if it's
+    // actually present in the room right now AND publishing a live unmuted mic.
+    if (preferredIdentity) {
+      const pref = participants.find(
+        (p) => p.identity === preferredIdentity && p.identity !== excludeIdentity
+      );
+      const prefAudio = (pref?.tracks || []).find(isLiveAudio);
+      if (prefAudio) {
+        return { identity: preferredIdentity, audioSid: prefAudio.sid };
+      }
+    }
+
+    // Second pass: any OTHER participant with a live unmuted mic. This covers
+    // the case where the stored host is stale/gone but someone else (the real
+    // current host) is talking.
+    for (const p of participants) {
+      if (!p.identity || p.identity === excludeIdentity) continue;
+      const audio = (p.tracks || []).find(isLiveAudio);
+      if (audio) {
+        return { identity: p.identity, audioSid: audio.sid };
+      }
+    }
+  } catch (e) {
+    console.log(`Live-audio lookup note in ${room}:`, e?.message || e);
+  }
+  return { identity: undefined, audioSid: undefined };
+}
+
 function roomRequests(room) {
   if (!requests[room]) requests[room] = {};
   return requests[room];
@@ -523,6 +573,14 @@ app.post('/mute-participant', async (req, res) => {
 // record. Each person records independently, producing a separate file.
 // Filename: {room}/{EventName}__{Username}__{timestamp}.mp4
 app.post('/start-recording', async (req, res) => {
+  // ENTRY LOG: prints the instant this route is hit, before ANY logic runs.
+  // If the phone's record button gets a 200 but this line never appears in the
+  // Render logs, the 200 is NOT coming from this running server (stale instance
+  // / wrong URL / cached response) — an infrastructure issue, not a code bug.
+  // If it DOES appear, the route runs and any silence is downstream (egress).
+  console.log(
+    `[start-recording] HIT room=${req.body?.room} user=${req.body?.username}`
+  );
   try {
     const { room, username } = req.body || {};
     if (!room || !username) {
@@ -642,9 +700,8 @@ app.post('/start-recording', async (req, res) => {
     let usedComposite = false;
 
     if (nearbyActive && !recorderIsHost && hostIdentity) {
-      // Look up the joiner's video + audio tracks and the host's audio track.
+      // Look up the joiner's video track (their own feed, which we always keep).
       const joinerTracks = await getParticipantTrackSids(svc, room, username);
-      const hostTracks = await getParticipantTrackSids(svc, room, hostIdentity);
 
       // Is the joiner's mic actually muted right now? If they overrode in soft
       // mode, it's live and we should record their own audio instead.
@@ -661,20 +718,30 @@ app.post('/start-recording', async (req, res) => {
         joinerMicMuted = true;
       }
 
-      // DIAGNOSTIC: log exactly what the composite decision sees. If the joiner
-      // recording is coming out silent while muted, this line shows why: e.g. a
-      // missing hostAudioSid (host mic not publishing / host identity wrong)
-      // makes the composite condition fail and we fall through to the normal
-      // path, which records the joiner's own (muted) mic = silence.
-      console.log(
-        `[record-decision] room=${room} recorder=${username} nearby=${nearbyMode} ` +
-        `hostIdentity=${hostIdentity} joinerMicMuted=${joinerMicMuted} ` +
-        `joinerVideoSid=${joinerTracks.videoSid || 'NONE'} ` +
-        `hostAudioSid=${hostTracks.audioSid || 'NONE'}`
+      // FIND LIVE HOST AUDIO — the fix for silent joiner recordings.
+      // Instead of blindly trusting hostNames[room] (which can go stale after a
+      // solo/Home session reuses the shared room and never re-registers the
+      // host, leaving a dead identity whose audio track SID records SILENCE),
+      // we scan the room's CURRENT participants for a real, unmuted, live mic.
+      // We still prefer the stored host identity IF it's actually connected and
+      // talking; otherwise we fall back to whoever is actually the live voice in
+      // the room (excluding the muted joiner who's recording).
+      const liveAudio = await findLiveAudioPublisher(
+        svc, room, username /* exclude the joiner */, hostIdentity /* prefer stored host */
       );
 
-      if (joinerMicMuted && joinerTracks.videoSid && hostTracks.audioSid) {
-        // Track Composite: joiner video + host audio -> single MP4.
+      // DIAGNOSTIC: log exactly what the composite decision sees, including the
+      // live-audio result so a silent recording is immediately explainable.
+      console.log(
+        `[record-decision] room=${room} recorder=${username} nearby=${nearbyMode} ` +
+        `storedHost=${hostIdentity} joinerMicMuted=${joinerMicMuted} ` +
+        `joinerVideoSid=${joinerTracks.videoSid || 'NONE'} ` +
+        `liveAudioFrom=${liveAudio.identity || 'NONE'} ` +
+        `liveAudioSid=${liveAudio.audioSid || 'NONE'}`
+      );
+
+      if (joinerMicMuted && joinerTracks.videoSid && liveAudio.audioSid) {
+        // Track Composite: joiner video + a VERIFIED LIVE host/voice audio -> MP4.
         try {
           info = await egressClient.startTrackCompositeEgress(
             room,
@@ -683,14 +750,15 @@ app.post('/start-recording', async (req, res) => {
               encodingOptions: encoding,
             },
             {
-              audioTrackId: hostTracks.audioSid,
+              audioTrackId: liveAudio.audioSid,
               videoTrackId: joinerTracks.videoSid,
             }
           );
           usedComposite = true;
           console.log(
             `[record-decision] started COMPOSITE egress ${info.egressId} ` +
-            `(joiner video ${joinerTracks.videoSid} + host audio ${hostTracks.audioSid})`
+            `(joiner video ${joinerTracks.videoSid} + live audio ${liveAudio.audioSid} ` +
+            `from ${liveAudio.identity})`
           );
         } catch (compErr) {
           // If the composite call fails, log it loudly and fall through to the
