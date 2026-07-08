@@ -623,6 +623,16 @@ app.post('/start-recording', async (req, res) => {
       return res.status(400).json({ error: 'room and username are required' });
     }
 
+    // The phone tells us directly whether THIS recorder is muted right now
+    // (they're a joiner in a soft/hard Nearby state). We trust this flag from
+    // the app instead of trying to read LiveKit's source-side track "muted"
+    // state, which proved unreliable: the joiner's mute happens locally on
+    // their phone and doesn't consistently reflect in listParticipants(), so
+    // the server saw them as unmuted and skipped compositing host audio =
+    // silent recordings. The app KNOWS its own Nearby/mute state, so it sends
+    // it. Accepts { muted: true|false }; defaults to false if absent.
+    const clientSaysMuted = req.body?.muted === true;
+
     const apiKey = process.env.LIVEKIT_API_KEY;
     const apiSecret = process.env.LIVEKIT_API_SECRET;
     if (!apiKey || !apiSecret) {
@@ -732,39 +742,15 @@ app.post('/start-recording', async (req, res) => {
     let info;
     let usedComposite = false;
 
-    // Determine, from ACTUAL LIVE ROOM STATE, whether this recorder's own mic is
-    // muted at the source right now. This is the robust trigger for compositing
-    // host audio — and it deliberately does NOT depend on the in-memory
-    // nearbyModes[room] flag, which gets WIPED every time the shared room is torn
-    // down (session timer / room_finished webhook) and recreated. Relying on that
-    // flag caused silent recordings: the host muted the joiner (flag set), the
-    // room got torn down (flag wiped), the phones auto-reconnected, and by the
-    // time the joiner recorded the server thought Nearby was OFF -> no composite
-    // -> recorded the joiner's own muted mic -> silence. The joiner's real mic
-    // mute state survives all of that, so we key off it directly.
-    let recorderMicMuted = false;
-    try {
-      const rp = await svc.getParticipant(room, username);
-      const rAudio = (rp?.tracks || []).find(
-        (t) => t.type === 0 || t.type === 'AUDIO' || t.type === 'audio' ||
-               t.source === 2 || t.source === 'MICROPHONE' || t.source === 'microphone'
-      );
-      // Muted if the track exists and is muted, OR if there's no published mic
-      // track at all (nothing to record from this participant = effectively muted).
-      recorderMicMuted = rAudio ? (rAudio.muted === true) : true;
-    } catch (e) {
-      recorderMicMuted = false; // if we truly can't tell, don't force composite
-    }
-
     // Is this recorder the host? The host records their own feed normally (they
-    // have live audio). We treat someone as "the muted joiner needing host audio"
-    // when their OWN mic is muted at the source. That covers soft/hard Nearby
-    // regardless of whether the in-memory flag survived a teardown.
+    // have their own live audio). Only a muted JOINER needs host audio composited.
     const recorderIsHost = hostIdentity && hostIdentity === username;
 
-    // COMPOSITE TRIGGER: the recorder's own mic is muted (so recording their own
-    // feed would be silent), and they are not the host. We no longer require
-    // nearbyActive from the wipeable flag — the live mute state IS the signal.
+    // COMPOSITE TRIGGER: the phone told us this recorder is muted (soft/hard
+    // Nearby), so recording their own feed would be silent. We use the app's
+    // own flag rather than LiveKit's unreliable source-side muted state. Host
+    // never composites (they have their own live audio).
+    const recorderMicMuted = clientSaysMuted;
     if (recorderMicMuted && !recorderIsHost) {
       // Look up the joiner's video track (their own feed, which we always keep).
       const joinerTracks = await getParticipantTrackSids(svc, room, username);
