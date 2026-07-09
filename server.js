@@ -751,6 +751,16 @@ app.post('/start-recording', async (req, res) => {
     // own flag rather than LiveKit's unreliable source-side muted state. Host
     // never composites (they have their own live audio).
     const recorderMicMuted = clientSaysMuted;
+
+    // ALWAYS-ON DECISION LOG: prints for EVERY recording, muted or not, so we
+    // can always see what the server received. If clientSaysMuted is false the
+    // phone either isn't muted OR isn't sending the flag (old app build).
+    console.log(
+      `[record-decision] room=${room} recorder=${username} nearbyFlag=${nearbyMode} ` +
+      `clientSaysMuted=${clientSaysMuted} recorderIsHost=${!!recorderIsHost} ` +
+      `storedHost=${hostIdentity || 'NONE'} willComposite=${recorderMicMuted && !recorderIsHost}`
+    );
+
     if (recorderMicMuted && !recorderIsHost) {
       // Look up the joiner's video track (their own feed, which we always keep).
       const joinerTracks = await getParticipantTrackSids(svc, room, username);
