@@ -528,6 +528,10 @@ app.post('/set-nearby', (req, res) => {
     next = 'off';
   }
   nearbyModes[room] = next;
+  console.log(
+    `[set-nearby] room=${room} -> mode=${next} ` +
+    `(received mode=${mode ?? 'none'} on=${on ?? 'none'})`
+  );
   res.json({ ok: true, mode: next, on: next !== 'off' });
 });
 
