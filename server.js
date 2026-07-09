@@ -109,13 +109,49 @@ app.post(
       if (event?.event === 'room_finished') {
         const room = event?.room?.name;
         if (room) {
-          console.log(`Webhook: room_finished for ${room} — tearing down.`);
           const apiKey = process.env.LIVEKIT_API_KEY;
           const apiSecret = process.env.LIVEKIT_API_SECRET;
+
+          // GUARD AGAINST FALSE TEARDOWN.
+          // LiveKit Cloud fires room_finished when a room hits its empty-timeout,
+          // which can happen during a brief network blip or right as phones are
+          // reconnecting between tests — NOT only when everyone has truly left.
+          // Blindly wiping state here was the root cause of Nearby mute silently
+          // resetting mid-session: nearbyModes[room] and hostNames[room] got
+          // erased, the joiner's app self-restored its mic on reconnect, and by
+          // record-time the server saw nearbyFlag=off / clientSaysMuted=false =>
+          // no composite => silent joiner recording. So before tearing anything
+          // down we ASK LiveKit whether the room is actually empty right now. If
+          // anyone is still connected (or has already reconnected), this was a
+          // false alarm: we keep all state and let the session continue.
+          let activeCount = 0;
           if (apiKey && apiSecret) {
-            await stopRoomRecordings(room, apiKey, apiSecret);
+            try {
+              const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+              const participants = await svc.listParticipants(room);
+              activeCount = Array.isArray(participants) ? participants.length : 0;
+            } catch (e) {
+              // If the room truly no longer exists, listParticipants throws —
+              // that means it IS empty/gone, so activeCount stays 0 and we tear
+              // down normally below.
+              activeCount = 0;
+            }
           }
-          clearRoomState(room);
+
+          if (activeCount > 0) {
+            console.log(
+              `Webhook: room_finished for ${room} IGNORED — ${activeCount} ` +
+              `participant(s) still connected (false teardown, keeping state alive).`
+            );
+          } else {
+            console.log(
+              `Webhook: room_finished for ${room} — room is empty, tearing down.`
+            );
+            if (apiKey && apiSecret) {
+              await stopRoomRecordings(room, apiKey, apiSecret);
+            }
+            clearRoomState(room);
+          }
         }
       }
 
