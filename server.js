@@ -16,6 +16,7 @@ import {
   GetObjectCommand,
   DeleteObjectCommand,
   PutObjectCommand,
+  CopyObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -1047,6 +1048,226 @@ app.post('/upload-snapshot', async (req, res) => {
 });
 
 // ---- Delete one recording from R2 by its key ----
+// ---- Submit a report (harassment, hate speech, nudity, etc.) ----
+//
+// Anyone can report — including reporting the session host. That is deliberate:
+// if only hosts could report, an abusive host would be unreportable, which is
+// exactly the hole Apple looks for in a UGC app.
+//
+// Body:
+//   reason        (required) one of the REPORT_REASONS below
+//   comment       (optional) free text from the reporter
+//   room          (optional) which session
+//   event         (optional) the event name
+//   reporterId    (required) the reporter's InstallID — NOT their username
+//   reporterName  (optional) their display name, for a human-readable log
+//   accusedId     (optional) InstallID of the person being reported
+//   accusedName   (optional) their display name
+//   recordingKey  (optional) the R2 key of the recording being reported
+//
+// WHY InstallID AND NOT THE USERNAME:
+// Usernames are self-typed and collide — two people can both be "Mike". A
+// report naming "Mike" is unactionable. The InstallID is unique per install, so
+// a report actually points at somebody. It is not bulletproof (reinstalling
+// mints a new ID) but it is the difference between a report you can act on and
+// a complaint you cannot.
+//
+// EVIDENCE PRESERVATION:
+// Normal recordings live under {room}/ and are auto-deleted after 24h by an R2
+// bucket LIFECYCLE RULE — which runs on Cloudflare's side, not ours. We cannot
+// tell that rule to skip an object. So if someone reports a recording at hour
+// 23, the evidence would evaporate before anyone looked at it.
+//
+// Instead we COPY the reported object into reports/evidence/ the moment the
+// report lands. That prefix must be EXCLUDED from the 24h lifecycle rule in the
+// Cloudflare dashboard (otherwise the copy dies too — see setup note below).
+// The original still expires on schedule, so normal ephemerality is untouched.
+const REPORT_REASONS = [
+  'harassment',
+  'hate_speech',
+  'threats',
+  'nudity',
+  'spam',
+  'other',
+];
+
+app.post('/report', async (req, res) => {
+  try {
+    const {
+      reason,
+      comment,
+      room,
+      event,
+      reporterId,
+      reporterName,
+      accusedId,
+      accusedName,
+      recordingKey,
+    } = req.body || {};
+
+    if (!reason || !REPORT_REASONS.includes(reason)) {
+      return res.status(400).json({
+        error: 'A valid reason is required.',
+        allowed: REPORT_REASONS,
+      });
+    }
+    if (!reporterId) {
+      return res.status(400).json({ error: 'reporterId is required.' });
+    }
+
+    const s3 = makeR2Client();
+    const r2Bucket = process.env.R2_BUCKET;
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    const now = Date.now();
+    const reportId = `${now}_${Math.random().toString(36).slice(2, 10)}`;
+
+    // Preserve the evidence BEFORE writing the report, so the report can record
+    // whether we actually managed to keep a copy. If the copy fails we still
+    // file the report — a report with no video beats no report at all.
+    let evidenceKey = null;
+    let evidenceError = null;
+    if (recordingKey) {
+      try {
+        const fileName = recordingKey.split('/').pop();
+        evidenceKey = `reports/evidence/${reportId}__${fileName}`;
+        await s3.send(
+          new CopyObjectCommand({
+            Bucket: r2Bucket,
+            CopySource: `${r2Bucket}/${recordingKey}`,
+            Key: evidenceKey,
+          })
+        );
+        console.log(
+          `[report] evidence preserved: ${recordingKey} -> ${evidenceKey}`
+        );
+      } catch (copyErr) {
+        evidenceKey = null;
+        evidenceError = String(copyErr && copyErr.message ? copyErr.message : copyErr);
+        console.error('[report] evidence copy FAILED:', evidenceError);
+      }
+    }
+
+    const report = {
+      id: reportId,
+      status: 'pending',            // pending | reviewing | closed
+      createdAt: new Date(now).toISOString(),
+      reason,
+      comment: (comment || '').slice(0, 2000),
+      room: room || null,
+      event: event || null,
+      reporter: {
+        installId: reporterId,
+        name: reporterName || null,
+      },
+      accused: {
+        installId: accusedId || null,
+        name: accusedName || null,
+      },
+      // The original — will be gone after 24h.
+      recordingKey: recordingKey || null,
+      // Our retained copy — this is the one that survives.
+      evidenceKey,
+      evidenceError,
+    };
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: r2Bucket,
+        Key: `reports/${reportId}.json`,
+        Body: JSON.stringify(report, null, 2),
+        ContentType: 'application/json',
+      })
+    );
+
+    console.log(
+      `[report] FILED id=${reportId} reason=${reason} ` +
+      `reporter=${reporterId} accused=${accusedId || 'NONE'} ` +
+      `room=${room || 'NONE'} evidence=${evidenceKey ? 'YES' : 'NO'}`
+    );
+
+    // The reporter gets a plain acknowledgement. We never tell them what action
+    // was or wasn't taken against the other person — that is not their business
+    // and telling them invites retaliation.
+    res.json({
+      ok: true,
+      id: reportId,
+      message: 'Thank you. We received your report and will review it as soon as possible.',
+    });
+  } catch (err) {
+    console.error('Report error:', err);
+    res.status(500).json({ error: 'Failed to file report' });
+  }
+});
+
+// ---- Admin: list reports ----
+//
+// Deliberately NOT a pretty dashboard — this is the smallest thing that lets a
+// human actually read what came in. A report system nobody reads is theater.
+//
+// Protected by ADMIN_TOKEN (set it in Render's environment). Without that env
+// var set, this endpoint refuses to serve anything at all rather than defaulting
+// to open — a wide-open list of abuse reports would be its own privacy incident.
+//
+// Usage:  GET /admin/reports?token=YOUR_ADMIN_TOKEN
+app.get('/admin/reports', async (req, res) => {
+  try {
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      return res.status(503).json({
+        error: 'Admin access is not configured (ADMIN_TOKEN is not set).',
+      });
+    }
+    if (req.query.token !== adminToken) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const s3 = makeR2Client();
+    const r2Bucket = process.env.R2_BUCKET;
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    const listed = await s3.send(
+      new ListObjectsV2Command({ Bucket: r2Bucket, Prefix: 'reports/' })
+    );
+    const files = (listed.Contents || []).filter(
+      (o) => o.Key && o.Key.endsWith('.json')
+    );
+    files.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
+
+    const out = [];
+    for (const f of files) {
+      try {
+        const obj = await s3.send(
+          new GetObjectCommand({ Bucket: r2Bucket, Key: f.Key })
+        );
+        const body = await obj.Body.transformToString();
+        const parsed = JSON.parse(body);
+
+        // Signed link to the retained evidence so it can actually be watched.
+        if (parsed.evidenceKey) {
+          parsed.evidenceUrl = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: r2Bucket, Key: parsed.evidenceKey }),
+            { expiresIn: 3600 }
+          );
+        }
+        out.push(parsed);
+      } catch (e) {
+        console.error('Could not read report', f.Key, e);
+      }
+    }
+
+    res.json({ count: out.length, reports: out });
+  } catch (err) {
+    console.error('Admin reports error:', err);
+    res.status(500).json({ error: 'Failed to list reports' });
+  }
+});
+
 app.post('/delete-recording', async (req, res) => {
   try {
     const { key } = req.body || {};
