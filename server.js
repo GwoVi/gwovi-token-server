@@ -176,6 +176,11 @@ app.use(express.json({ limit: '15mb' }));
 // ---- Free-tier limits ----
 // These are the FREE tier limits. When StoreKit/paid tiers are added later,
 // paid users should bypass these (e.g. higher cap, no session timeout).
+// Parent prefix for all recordings/snapshots in R2: recordings/{room}/...
+// Scoping the 24h auto-delete lifecycle rule to this prefix lets recordings
+// expire on schedule while preserved abuse evidence under reports/ survives.
+const RECORDINGS_PREFIX = 'recordings/';
+
 // Max people allowed in a room (host + 2 others) on the free tier.
 const MAX_PARTICIPANTS = 3;
 // How long a free-tier session can run before it auto-ends (milliseconds).
@@ -721,11 +726,16 @@ app.post('/start-recording', async (req, res) => {
     //   - event name  -> shown as the title
     //   - username    -> whose feed this is (shown in details)
     //   - host        -> who may DELETE this video (host-of-this-session only)
-    // Format: {room}/{EventName}__{Username}__{Host}__{timestamp}.mp4
+    // Format: recordings/{room}/{EventName}__{Username}__{Host}__{timestamp}.mp4
     // The double underscore "__" is the separator the app looks for. Timestamp
     // stays LAST so date parsing is unaffected. Older 3-part names
     // (Event__Username__timestamp) still parse (no host segment -> not
     // deletable by anyone, safe default).
+    //
+    // The leading `recordings/` parent exists so the R2 lifecycle rule can
+    // auto-delete recordings after 24h by scoping to the `recordings/` prefix,
+    // WITHOUT touching `reports/` (preserved abuse evidence must outlive 24h).
+    // The gallery list below uses the SAME prefix — keep the two in lockstep.
     const stamp = Date.now();
     const safeEvent = safeToken((eventNames[room] || '').trim(), 60);
     const safeUser = safeToken(username, 40);
@@ -733,7 +743,7 @@ app.post('/start-recording', async (req, res) => {
     const eventPart = safeEvent.length > 0 ? safeEvent : room;
     const userPart = safeUser.length > 0 ? safeUser : 'user';
     const hostPart = safeHost.length > 0 ? safeHost : 'host';
-    const filepath = `${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
+    const filepath = `${RECORDINGS_PREFIX}${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
 
     const fileOutput = new EncodedFileOutput({
       fileType: EncodedFileType.MP4,
@@ -946,13 +956,30 @@ app.get('/recordings', async (req, res) => {
       return res.status(500).json({ error: 'Server missing R2 credentials' });
     }
 
-    // List everything stored under this room's folder.
-    const listed = await s3.send(
-      new ListObjectsV2Command({
-        Bucket: r2Bucket,
-        Prefix: `${room}/`,
-      })
-    );
+    // List everything stored under this room's folder. We list the NEW
+    // location (recordings/{room}/) and also the LEGACY location ({room}/) so
+    // recordings made before the prefix change still appear until they age out
+    // under the 24h rule. Results are merged below.
+    const [listedNew, listedLegacy] = await Promise.all([
+      s3.send(
+        new ListObjectsV2Command({
+          Bucket: r2Bucket,
+          Prefix: `${RECORDINGS_PREFIX}${room}/`,
+        })
+      ),
+      s3.send(
+        new ListObjectsV2Command({
+          Bucket: r2Bucket,
+          Prefix: `${room}/`,
+        })
+      ),
+    ]);
+    const listed = {
+      Contents: [
+        ...(listedNew.Contents || []),
+        ...(listedLegacy.Contents || []),
+      ],
+    };
 
     const objects = listed.Contents || [];
 
