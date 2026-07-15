@@ -176,11 +176,6 @@ app.use(express.json({ limit: '15mb' }));
 // ---- Free-tier limits ----
 // These are the FREE tier limits. When StoreKit/paid tiers are added later,
 // paid users should bypass these (e.g. higher cap, no session timeout).
-// Parent prefix for all recordings/snapshots in R2: recordings/{room}/...
-// Scoping the 24h auto-delete lifecycle rule to this prefix lets recordings
-// expire on schedule while preserved abuse evidence under reports/ survives.
-const RECORDINGS_PREFIX = 'recordings/';
-
 // Max people allowed in a room (host + 2 others) on the free tier.
 const MAX_PARTICIPANTS = 3;
 // How long a free-tier session can run before it auto-ends (milliseconds).
@@ -402,6 +397,44 @@ function makeR2Client() {
   });
 }
 
+// ---- Ban list (server-side enforcement) -------------------------------------
+// A ban keys on InstallID (see InstallID.swift). When an InstallID is banned,
+// /token refuses to mint a LiveKit token for it, so that install cannot join
+// any room. The whole list lives in ONE R2 object, bans.json, shaped:
+//   { "<installId>": { reason, ts, reportId }, ... }
+// The list is tiny (a set of UUIDs), so one object is simpler than one file
+// per ban and avoids a LIST on every /token call.
+//
+// HONEST LIMIT: InstallID resets on reinstall, so a ban is device-level, not a
+// person-level ban. It raises the cost of return without preventing it. Durable
+// exclusion needs accounts (V2). Do not represent this as more than it is.
+const BANS_KEY = 'bans.json';
+
+async function readBans(s3, bucket) {
+  try {
+    const obj = await s3.send(
+      new GetObjectCommand({ Bucket: bucket, Key: BANS_KEY })
+    );
+    const text = await obj.Body.transformToString();
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (e) {
+    // No bans.json yet (nobody banned) reads as an empty list, not an error.
+    return {};
+  }
+}
+
+async function writeBans(s3, bucket, bans) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: BANS_KEY,
+      Body: JSON.stringify(bans, null, 2),
+      ContentType: 'application/json',
+    })
+  );
+}
+
 // Turns a raw event name into a filename-safe token. Keeps letters, numbers,
 // spaces and hyphens; collapses whitespace to single underscores; trims to a
 // reasonable length. Returns '' if nothing usable remains.
@@ -453,7 +486,7 @@ app.get('/end-room', async (req, res) => {
 // same grant as before (no roomAdmin), so their join path is unchanged.
 app.post('/token', async (req, res) => {
   try {
-    const { username, room, isHost } = req.body || {};
+    const { username, room, isHost, installId } = req.body || {};
     if (!username || !room) {
       return res.status(400).json({ error: 'username and room are required' });
     }
@@ -462,6 +495,27 @@ app.post('/token', async (req, res) => {
     const apiSecret = process.env.LIVEKIT_API_SECRET;
     if (!apiKey || !apiSecret) {
       return res.status(500).json({ error: 'Server missing LiveKit credentials' });
+    }
+
+    // Ban check FIRST — a banned install shouldn't even reach the capacity
+    // check. Distinct error 'banned' (not the 'Room is full' 403) so the app
+    // can show the right message. If R2 is unreachable we log and continue
+    // rather than locking everyone out on an infra hiccup (fail-open: the
+    // enforcement is best-effort, and a hard dependency here would make the
+    // whole app unjoinable if bans.json ever failed to read).
+    if (installId) {
+      try {
+        const s3 = makeR2Client();
+        const r2Bucket = process.env.R2_BUCKET;
+        if (s3 && r2Bucket) {
+          const bans = await readBans(s3, r2Bucket);
+          if (bans[installId]) {
+            return res.status(403).json({ error: 'banned' });
+          }
+        }
+      } catch (banErr) {
+        console.log('Ban check note:', banErr?.message || banErr);
+      }
     }
 
     try {
@@ -726,16 +780,11 @@ app.post('/start-recording', async (req, res) => {
     //   - event name  -> shown as the title
     //   - username    -> whose feed this is (shown in details)
     //   - host        -> who may DELETE this video (host-of-this-session only)
-    // Format: recordings/{room}/{EventName}__{Username}__{Host}__{timestamp}.mp4
+    // Format: {room}/{EventName}__{Username}__{Host}__{timestamp}.mp4
     // The double underscore "__" is the separator the app looks for. Timestamp
     // stays LAST so date parsing is unaffected. Older 3-part names
     // (Event__Username__timestamp) still parse (no host segment -> not
     // deletable by anyone, safe default).
-    //
-    // The leading `recordings/` parent exists so the R2 lifecycle rule can
-    // auto-delete recordings after 24h by scoping to the `recordings/` prefix,
-    // WITHOUT touching `reports/` (preserved abuse evidence must outlive 24h).
-    // The gallery list below uses the SAME prefix — keep the two in lockstep.
     const stamp = Date.now();
     const safeEvent = safeToken((eventNames[room] || '').trim(), 60);
     const safeUser = safeToken(username, 40);
@@ -743,7 +792,7 @@ app.post('/start-recording', async (req, res) => {
     const eventPart = safeEvent.length > 0 ? safeEvent : room;
     const userPart = safeUser.length > 0 ? safeUser : 'user';
     const hostPart = safeHost.length > 0 ? safeHost : 'host';
-    const filepath = `${RECORDINGS_PREFIX}${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
+    const filepath = `${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
 
     const fileOutput = new EncodedFileOutput({
       fileType: EncodedFileType.MP4,
@@ -956,30 +1005,13 @@ app.get('/recordings', async (req, res) => {
       return res.status(500).json({ error: 'Server missing R2 credentials' });
     }
 
-    // List everything stored under this room's folder. We list the NEW
-    // location (recordings/{room}/) and also the LEGACY location ({room}/) so
-    // recordings made before the prefix change still appear until they age out
-    // under the 24h rule. Results are merged below.
-    const [listedNew, listedLegacy] = await Promise.all([
-      s3.send(
-        new ListObjectsV2Command({
-          Bucket: r2Bucket,
-          Prefix: `${RECORDINGS_PREFIX}${room}/`,
-        })
-      ),
-      s3.send(
-        new ListObjectsV2Command({
-          Bucket: r2Bucket,
-          Prefix: `${room}/`,
-        })
-      ),
-    ]);
-    const listed = {
-      Contents: [
-        ...(listedNew.Contents || []),
-        ...(listedLegacy.Contents || []),
-      ],
-    };
+    // List everything stored under this room's folder.
+    const listed = await s3.send(
+      new ListObjectsV2Command({
+        Bucket: r2Bucket,
+        Prefix: `${room}/`,
+      })
+    );
 
     const objects = listed.Contents || [];
 
@@ -1292,6 +1324,123 @@ app.get('/admin/reports', async (req, res) => {
   } catch (err) {
     console.error('Admin reports error:', err);
     res.status(500).json({ error: 'Failed to list reports' });
+  }
+});
+
+// ---- Admin: ban / unban / list bans -----------------------------------------
+// All three require the same ADMIN_TOKEN as /admin/reports. A ban keys on
+// InstallID; once banned, /token refuses that install (see the ban check
+// there). Workflow: review at /admin/reports, copy the accused installId, ban
+// it here.
+//
+// Guard helper is inlined per-route (same shape as /admin/reports) rather than
+// as middleware, to keep this a drop-in addition that doesn't touch app setup.
+app.post('/admin/ban', async (req, res) => {
+  try {
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      return res.status(503).json({
+        error: 'Admin access is not configured (ADMIN_TOKEN is not set).',
+      });
+    }
+    // Token may come via query (?token=) or JSON body, so this works from a
+    // browser URL or a proper POST.
+    const provided = req.query.token || (req.body && req.body.token);
+    if (provided !== adminToken) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const { installId, reason, reportId } = req.body || {};
+    if (!installId || typeof installId !== 'string') {
+      return res.status(400).json({ error: 'installId is required' });
+    }
+
+    const s3 = makeR2Client();
+    const r2Bucket = process.env.R2_BUCKET;
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    const bans = await readBans(s3, r2Bucket);
+    bans[installId] = {
+      reason: typeof reason === 'string' ? reason.slice(0, 500) : 'unspecified',
+      ts: new Date().toISOString(),
+      reportId: reportId || null,
+    };
+    await writeBans(s3, r2Bucket, bans);
+    console.log(`[admin] banned installId=${installId}`);
+    res.json({ ok: true, installId, banned: true });
+  } catch (err) {
+    console.error('Admin ban error:', err);
+    res.status(500).json({ error: 'Failed to ban' });
+  }
+});
+
+app.post('/admin/unban', async (req, res) => {
+  try {
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      return res.status(503).json({
+        error: 'Admin access is not configured (ADMIN_TOKEN is not set).',
+      });
+    }
+    const provided = req.query.token || (req.body && req.body.token);
+    if (provided !== adminToken) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const { installId } = req.body || {};
+    if (!installId || typeof installId !== 'string') {
+      return res.status(400).json({ error: 'installId is required' });
+    }
+
+    const s3 = makeR2Client();
+    const r2Bucket = process.env.R2_BUCKET;
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    const bans = await readBans(s3, r2Bucket);
+    if (bans[installId]) {
+      delete bans[installId];
+      await writeBans(s3, r2Bucket, bans);
+      console.log(`[admin] unbanned installId=${installId}`);
+    }
+    res.json({ ok: true, installId, banned: false });
+  } catch (err) {
+    console.error('Admin unban error:', err);
+    res.status(500).json({ error: 'Failed to unban' });
+  }
+});
+
+app.get('/admin/bans', async (req, res) => {
+  try {
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      return res.status(503).json({
+        error: 'Admin access is not configured (ADMIN_TOKEN is not set).',
+      });
+    }
+    if (req.query.token !== adminToken) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const s3 = makeR2Client();
+    const r2Bucket = process.env.R2_BUCKET;
+    if (!s3 || !r2Bucket) {
+      return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    const bans = await readBans(s3, r2Bucket);
+    const list = Object.entries(bans).map(([installId, meta]) => ({
+      installId,
+      ...meta,
+    }));
+    list.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    res.json({ count: list.length, bans: list });
+  } catch (err) {
+    console.error('Admin bans list error:', err);
+    res.status(500).json({ error: 'Failed to list bans' });
   }
 });
 
