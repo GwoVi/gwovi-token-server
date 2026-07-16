@@ -14,6 +14,7 @@ import {
   S3Client,
   ListObjectsV2Command,
   GetObjectCommand,
+  HeadObjectCommand,
   DeleteObjectCommand,
   PutObjectCommand,
   CopyObjectCommand,
@@ -176,6 +177,11 @@ app.use(express.json({ limit: '15mb' }));
 // ---- Free-tier limits ----
 // These are the FREE tier limits. When StoreKit/paid tiers are added later,
 // paid users should bypass these (e.g. higher cap, no session timeout).
+// Parent prefix for all recordings/snapshots in R2: recordings/{room}/...
+// Scoping the 24h auto-delete lifecycle rule to this prefix lets recordings
+// expire on schedule while preserved abuse evidence under reports/ survives.
+const RECORDINGS_PREFIX = 'recordings/';
+
 // Max people allowed in a room (host + 2 others) on the free tier.
 const MAX_PARTICIPANTS = 3;
 // How long a free-tier session can run before it auto-ends (milliseconds).
@@ -249,6 +255,27 @@ async function getParticipantTrackSids(svc, room, identity) {
     console.log(`Track lookup note for ${identity} in ${room}:`, e?.message || e);
   }
   return result;
+}
+
+// Reads a participant's InstallID out of their published LiveKit metadata.
+// Every participant publishes { installId, event? } as JSON metadata (see the
+// app's StreamManager). We look up the participant by identity (their username)
+// and pull installId back out. Returns null if not found or not published yet.
+// Used at record time to stamp the recorder's and host's InstallID onto the
+// recording, so the gallery can hide a blocked person's recordings exactly
+// (by InstallID) rather than by their collision-prone username.
+async function getParticipantInstallId(svc, room, identity) {
+  if (!identity) return null;
+  try {
+    const p = await svc.getParticipant(room, identity);
+    const meta = p?.metadata;
+    if (!meta) return null;
+    const parsed = JSON.parse(meta);
+    return typeof parsed?.installId === 'string' ? parsed.installId : null;
+  } catch (e) {
+    console.log(`InstallId lookup note for ${identity} in ${room}:`, e?.message || e);
+    return null;
+  }
 }
 
 // Returns the SID of a LIVE, UNMUTED microphone audio track published by some
@@ -733,6 +760,13 @@ app.post('/start-recording', async (req, res) => {
     // it. Accepts { muted: true|false }; defaults to false if absent.
     const clientSaysMuted = req.body?.muted === true;
 
+    // The recorder's own InstallID, sent by the phone (same value it sends to
+    // /token). Stamped onto the recording as R2 object metadata so the gallery
+    // can hide a blocked person's recordings by InstallID, not by username.
+    // Optional: an older app build that doesn't send it just yields no stamp.
+    const recorderInstallId =
+      typeof req.body?.installId === 'string' ? req.body.installId : null;
+
     const apiKey = process.env.LIVEKIT_API_KEY;
     const apiSecret = process.env.LIVEKIT_API_SECRET;
     if (!apiKey || !apiSecret) {
@@ -792,21 +826,61 @@ app.post('/start-recording', async (req, res) => {
     const eventPart = safeEvent.length > 0 ? safeEvent : room;
     const userPart = safeUser.length > 0 ? safeUser : 'user';
     const hostPart = safeHost.length > 0 ? safeHost : 'host';
-    const filepath = `${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
+    // Recordings live under recordings/{room}/... so the 24h lifecycle rule can
+    // target the recordings/ prefix while leaving reports/ (evidence) alone.
+    const filepath = `${RECORDINGS_PREFIX}${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
+
+    // svc is used both here (to read the host's InstallID) and further down for
+    // the Nearby composite decision. Created once here so we don't build it
+    // twice.
+    const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+
+    // Stamp the recorder's and host's InstallID onto the recording as R2 object
+    // metadata. The recorder's comes from the request body; the host's is read
+    // from the host participant's published LiveKit metadata. This lets the
+    // gallery hide a blocked person's recordings by InstallID (exact) instead
+    // of by username (collision-prone). Both are best-effort — if either is
+    // missing, the recording is still made, just without that stamp.
+    let hostInstallId = null;
+    try {
+      const hostIdentityForStamp = hostNames[room];
+      if (hostIdentityForStamp) {
+        hostInstallId = await getParticipantInstallId(svc, room, hostIdentityForStamp);
+      }
+    } catch (e) {
+      console.log('Host InstallId stamp note:', e?.message || e);
+    }
+
+    // R2/S3 custom metadata must be string values. Only include keys we actually
+    // have, so we never write "null" strings.
+    const uploadMetadata = {};
+    if (recorderInstallId) uploadMetadata.installid = recorderInstallId;
+    if (hostInstallId) uploadMetadata.hostinstallid = hostInstallId;
+
+    console.log(
+      `[record-stamp] room=${room} recorder=${username} ` +
+      `recorderInstallId=${recorderInstallId || 'NONE'} ` +
+      `hostInstallId=${hostInstallId || 'NONE'}`
+    );
+
+    const s3UploadOpts = {
+      accessKey: r2AccessKey,
+      secret: r2Secret,
+      bucket: r2Bucket,
+      endpoint: r2Endpoint,
+      region: 'auto',
+      forcePathStyle: true,
+    };
+    if (Object.keys(uploadMetadata).length > 0) {
+      s3UploadOpts.metadata = uploadMetadata;
+    }
 
     const fileOutput = new EncodedFileOutput({
       fileType: EncodedFileType.MP4,
       filepath: filepath,
       output: {
         case: 's3',
-        value: new S3Upload({
-          accessKey: r2AccessKey,
-          secret: r2Secret,
-          bucket: r2Bucket,
-          endpoint: r2Endpoint,
-          region: 'auto',
-          forcePathStyle: true,
-        }),
+        value: new S3Upload(s3UploadOpts),
       },
     });
 
@@ -835,7 +909,7 @@ app.post('/start-recording', async (req, res) => {
     // is live, so we record their OWN feed normally. We decide by checking the
     // joiner's actual audio-track mute state at record-start (no mid-recording
     // swap), which is exactly the rule we want.
-    const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+    // (svc was created earlier in this handler for the InstallID stamp.)
     const nearbyMode = nearbyModes[room] || 'off';
     const hostIdentity = hostNames[room];
 
@@ -1005,15 +1079,28 @@ app.get('/recordings', async (req, res) => {
       return res.status(500).json({ error: 'Server missing R2 credentials' });
     }
 
-    // List everything stored under this room's folder.
-    const listed = await s3.send(
-      new ListObjectsV2Command({
-        Bucket: r2Bucket,
-        Prefix: `${room}/`,
-      })
-    );
+    // List everything under BOTH the new recordings/{room}/ location and the
+    // legacy {room}/ location, so recordings made before the prefix change
+    // still appear until they age out. Merge the two.
+    const [listedNew, listedLegacy] = await Promise.all([
+      s3.send(
+        new ListObjectsV2Command({
+          Bucket: r2Bucket,
+          Prefix: `${RECORDINGS_PREFIX}${room}/`,
+        })
+      ),
+      s3.send(
+        new ListObjectsV2Command({
+          Bucket: r2Bucket,
+          Prefix: `${room}/`,
+        })
+      ),
+    ]);
 
-    const objects = listed.Contents || [];
+    const objects = [
+      ...(listedNew.Contents || []),
+      ...(listedLegacy.Contents || []),
+    ];
 
     // Keep video files (.mp4) and snapshot images (.jpg/.jpeg); skip LiveKit's
     // .json manifests and anything else.
@@ -1028,7 +1115,11 @@ app.get('/recordings', async (req, res) => {
     // Newest first.
     media.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
-    // Build a temporary signed URL (valid 1 hour) for each one.
+    // Build a temporary signed URL (valid 1 hour) for each one, and read back
+    // the InstallID metadata we stamped at record time (recorder + host) so the
+    // app can hide a blocked person's recordings by InstallID. Metadata isn't
+    // returned by ListObjects, so we HEAD each object. Recording counts are
+    // small, so the extra calls are cheap; a HEAD failure just yields no stamp.
     const out = [];
     for (const v of media) {
       const url = await getSignedUrl(
@@ -1037,12 +1128,29 @@ app.get('/recordings', async (req, res) => {
         { expiresIn: 3600 }
       );
       const isPhoto = v.Key.endsWith('.jpg') || v.Key.endsWith('.jpeg');
+
+      let installId = null;
+      let hostInstallId = null;
+      try {
+        const head = await s3.send(
+          new HeadObjectCommand({ Bucket: r2Bucket, Key: v.Key })
+        );
+        // S3/R2 lowercases custom metadata keys and exposes them under Metadata.
+        const md = head?.Metadata || {};
+        installId = md.installid || null;
+        hostInstallId = md.hostinstallid || null;
+      } catch (e) {
+        // No metadata / HEAD failed — leave both null.
+      }
+
       out.push({
         key: v.Key,
         url: url,
         size: v.Size,
         modified: v.LastModified,
         type: isPhoto ? 'photo' : 'video',
+        installId,
+        hostInstallId,
       });
     }
 
@@ -1332,9 +1440,6 @@ app.get('/admin/reports', async (req, res) => {
 // InstallID; once banned, /token refuses that install (see the ban check
 // there). Workflow: review at /admin/reports, copy the accused installId, ban
 // it here.
-//
-// Guard helper is inlined per-route (same shape as /admin/reports) rather than
-// as middleware, to keep this a drop-in addition that doesn't touch app setup.
 app.post('/admin/ban', async (req, res) => {
   try {
     const adminToken = process.env.ADMIN_TOKEN;
@@ -1343,8 +1448,6 @@ app.post('/admin/ban', async (req, res) => {
         error: 'Admin access is not configured (ADMIN_TOKEN is not set).',
       });
     }
-    // Token may come via query (?token=) or JSON body, so this works from a
-    // browser URL or a proper POST.
     const provided = req.query.token || (req.body && req.body.token);
     if (provided !== adminToken) {
       return res.status(403).json({ error: 'Forbidden' });
