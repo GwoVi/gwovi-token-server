@@ -49,7 +49,6 @@ function clearRoomState(room) {
   clearSessionTimer(room);
   delete eventNames[room];
   delete hostNames[room];
-  delete nearbyModes[room];
   delete recordings[room];
   delete requests[room];
   delete sessionTimers[room];
@@ -118,11 +117,9 @@ app.post(
           // LiveKit Cloud fires room_finished when a room hits its empty-timeout,
           // which can happen during a brief network blip or right as phones are
           // reconnecting between tests — NOT only when everyone has truly left.
-          // Blindly wiping state here was the root cause of Nearby mute silently
-          // resetting mid-session: nearbyModes[room] and hostNames[room] got
-          // erased, the joiner's app self-restored its mic on reconnect, and by
-          // record-time the server saw nearbyFlag=off / clientSaysMuted=false =>
-          // no composite => silent joiner recording. So before tearing anything
+          // Blindly wiping state here was the root cause of silent joiner
+          // recordings: hostNames[room] got erased, so at record-time there was
+          // no host identity to composite audio from. So before tearing anything
           // down we ASK LiveKit whether the room is actually empty right now. If
           // anyone is still connected (or has already reconnected), this was a
           // false alarm: we keep all state and let the session continue.
@@ -206,19 +203,10 @@ const eventNames = {}; // eventNames[room] = "Baby shower"
 
 // ---- In-memory host identity per room ----
 // The host's LiveKit identity (their username). We capture it when the host
-// sets the event (goes live). Needed so that, in Nearby mode, a joiner's
-// recording can be composited with the HOST's audio track (the host is the
-// one participant left unmuted, so their voice is the shared audio).
+// sets the event (goes live). Needed so that a joiner who is recording while
+// their own mic is off can have their video composited with the HOST's audio
+// track, instead of producing a silent file.
 const hostNames = {}; // hostNames[room] = "Joseph"
-
-// ---- In-memory Nearby mode flag (host toggles when everyone's in one room) ----
-// When ON for a room, the app mutes every joiner's mic at the source to kill
-// the speaker->mic echo loop, and joiners' mics stay host-controlled. The
-// server just remembers the on/off state per room so newly-arriving joiners
-// can be muted on entry too. The actual muting is performed by the host app
-// via its room-admin token (see /token below); this flag is the shared
-// source of truth the app reads.
-const nearbyModes = {}; // nearbyModes[room] = 'off' | 'soft' | 'hard'
 
 // ---- In-memory active recordings ----
 // CHANGED: each person now records their OWN feed independently, so we track
@@ -234,7 +222,7 @@ function roomRecordings(room) {
 // Looks up a participant's published track SIDs (audio + video) from the live
 // room state via RoomService. Returns { audioSid, videoSid } (either may be
 // undefined if that track isn't published yet). Used for composite recordings
-// where we pair a joiner's video with the host's audio in Nearby mode.
+// where we pair a muted joiner's video with the host's audio.
 // TrackType in the LiveKit protocol: AUDIO === 0, VIDEO === 1.
 async function getParticipantTrackSids(svc, room, identity) {
   const result = { audioSid: undefined, videoSid: undefined };
@@ -351,10 +339,10 @@ function pruneOld(room) {
 //     reschedules the check for another SESSION_LIMIT_MS later.
 // This fixes the core bug behind silent recordings and dropped sessions: the
 // old timer deleted the room after 10 minutes no matter what, which tore down
-// ACTIVE sessions mid-use. Every teardown wiped Nearby mode + host identity and
+// ACTIVE sessions mid-use. Every teardown wiped host identity and
 // forced phones to reconnect, which reset the joiner's mic and broke the audio
 // composite. By only cleaning up genuinely empty rooms, an in-use session (and
-// all its Nearby/mute state) now survives as long as people are actually in it.
+// all its host/recording state) now survives as long as people are in it.
 function startSessionTimer(room, apiKey, apiSecret) {
   if (sessionTimers[room]) {
     clearTimeout(sessionTimers[room]);
@@ -390,12 +378,10 @@ function startSessionTimer(room, apiKey, apiSecret) {
       console.log(`Session cleanup: ended EMPTY room ${room}`);
       delete sessionTimers[room];
       delete recordings[room];
-      delete nearbyModes[room];
     } catch (e) {
       console.log('Session auto-end note:', e?.message || e);
       delete sessionTimers[room];
       delete recordings[room];
-      delete nearbyModes[room];
     }
   }, SESSION_LIMIT_MS);
 }
@@ -509,8 +495,9 @@ app.get('/end-room', async (req, res) => {
 // ---- Token minting ----
 // CHANGED: now accepts an optional { isHost } flag. When isHost is true, the
 // token additionally carries roomAdmin permission, which is what lets the
-// host app mute other participants' mics (Nearby mode). Joiners get the exact
-// same grant as before (no roomAdmin), so their join path is unchanged.
+// host app perform admin actions on other participants. V1 doesn't use it —
+// host-enforced muting is a planned paid-tier feature — but the grant is kept
+// so that tier doesn't need a token change. Joiners never receive it.
 app.post('/token', async (req, res) => {
   try {
     const { username, room, isHost, installId } = req.body || {};
@@ -571,9 +558,9 @@ app.post('/token', async (req, res) => {
       canUpdateOwnMetadata: true,
     };
 
-    // HOST ONLY: roomAdmin lets this participant mute other participants'
-    // tracks (the LiveKit admin mute used by Nearby mode). Only the host ever
-    // receives this; joiners never do.
+    // HOST ONLY: roomAdmin lets this participant perform LiveKit admin actions
+    // on other participants. Unused in V1; reserved for paid-tier host
+    // moderation. Only the host ever receives this; joiners never do.
     if (isHost === true) {
       grant.roomAdmin = true;
     }
@@ -585,148 +572,6 @@ app.post('/token', async (req, res) => {
   } catch (err) {
     console.error('Token error:', err);
     res.status(500).json({ error: 'Failed to create token' });
-  }
-});
-
-// ---- Nearby mode: host sets on/off for a room ----
-// Body: { room, on }  (on is boolean). The app reads this so newly-arriving
-// joiners know whether they should come in muted. The host app performs the
-// actual admin-mute of existing participants directly via LiveKit.
-//
-// THREE-STATE: mode is 'off' | 'soft' | 'hard'.
-//   off  = normal, nobody muted.
-//   soft = joiner mic+speaker muted for echo, but joiner MAY override (re-enable
-//          their own) if they've walked out of the echo zone.
-//   hard = joiner mic+speaker forced off, no override.
-// We accept either { mode } (new) or { on } (legacy boolean, true -> 'hard')
-// so an older app build can't wedge the flag. We also return both `mode` and a
-// legacy `on` (true when mode !== 'off') for backward compatibility.
-app.post('/set-nearby', (req, res) => {
-  const { room, mode, on } = req.body || {};
-  if (!room) {
-    return res.status(400).json({ error: 'room is required' });
-  }
-  let next;
-  if (mode === 'off' || mode === 'soft' || mode === 'hard') {
-    next = mode;
-  } else if (typeof on === 'boolean') {
-    next = on ? 'hard' : 'off';   // legacy boolean support
-  } else {
-    next = 'off';
-  }
-  nearbyModes[room] = next;
-  console.log(
-    `[set-nearby] room=${room} -> mode=${next} ` +
-    `(received mode=${mode ?? 'none'} on=${on ?? 'none'})`
-  );
-  res.json({ ok: true, mode: next, on: next !== 'off' });
-});
-
-// ---- Nearby mode: read state for a room ----
-app.get('/nearby', (req, res) => {
-  const room = req.query.room;
-  if (!room) {
-    return res.status(400).json({ error: 'room is required' });
-  }
-  const mode = nearbyModes[room] || 'off';
-  res.json({ mode: mode, on: mode !== 'off' });
-});
-
-// ---- Mute (or unmute) a participant's microphone at the source ----
-// Body: { room, identity, muted }  where identity is the participant's LiveKit
-// identity (their username) and muted is a boolean.
-//
-// This is the real echo fix for same-room use: the host (whose app calls this)
-// asks the server to mute a joiner's PUBLISHED audio track so that joiner stops
-// transmitting entirely. Because it's done server-side via RoomService, it
-// mutes the joiner for EVERYONE, killing the speaker->mic feedback loop at its
-// origin. Unmute (muted:false) restores their mic.
-//
-// We find the participant's audio track SID from the server's live view of the
-// room, then call mutePublishedTrack. If the participant has no audio track yet
-// (e.g. still connecting), we return ok with a note rather than erroring, so
-// the host's toggle never appears to "fail" for a transient timing reason.
-app.post('/mute-participant', async (req, res) => {
-  try {
-    const { room, identity, muted } = req.body || {};
-    if (!room || !identity || typeof muted !== 'boolean') {
-      return res
-        .status(400)
-        .json({ error: 'room, identity, and muted (boolean) are required' });
-    }
-
-    const apiKey = process.env.LIVEKIT_API_KEY;
-    const apiSecret = process.env.LIVEKIT_API_SECRET;
-    if (!apiKey || !apiSecret) {
-      return res.status(500).json({ error: 'Server missing LiveKit credentials' });
-    }
-
-    // MUTE-ONLY POLICY (privacy-clean echo control):
-    // LiveKit disallows server-side REMOTE UNMUTE by default (it returns a 412
-    // "remote unmute not enabled" for privacy reasons). Rather than enable that
-    // privacy-weakening setting, this server never remote-unmutes anyone. The
-    // server only ever MUTES a joiner at the source (echo control). Restoring a
-    // joiner's mic is done by the joiner's OWN app calling setMicrophone(true)
-    // on its own local participant — a participant unmuting THEMSELVES is always
-    // allowed and never triggers the 412. So here, an unmute request (muted =
-    // false) is acknowledged as a no-op success; only muted = true reaches
-    // LiveKit. This is what fixes the silent-joiner-recording bug: previously
-    // the host cycling Nearby to OFF sent muted:false, LiveKit rejected it with
-    // 412, the joiner stayed muted at the source, and their next recording came
-    // out silent.
-    if (muted === false) {
-      return res.json({
-        ok: true,
-        applied: false,
-        reason: 'unmute is handled by the participant themselves (server is mute-only)',
-      });
-    }
-
-    const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
-
-    // Look up the participant and their audio track from the live room state.
-    let participant;
-    try {
-      participant = await svc.getParticipant(room, identity);
-    } catch (lookupErr) {
-      // Participant not found (maybe already left). Not a hard error for the
-      // host's toggle — just report it couldn't be applied.
-      console.log(
-        `Mute lookup note for ${identity} in ${room}:`,
-        lookupErr?.message || lookupErr
-      );
-      return res.json({ ok: true, applied: false, reason: 'participant not found' });
-    }
-
-    const tracks = participant?.tracks || [];
-    // Find the AUDIO track. In the LiveKit protocol TrackType.AUDIO === 0 and
-    // TrackType.VIDEO === 1, so we must match 0 here — matching 1 would grab
-    // the VIDEO track and muting that freezes the participant's camera on a
-    // stuck frame (which is exactly the bug we're fixing). We also match on the
-    // string forms and on source === microphone defensively, in case the SDK
-    // surfaces the type differently across versions.
-    const audioTrack = tracks.find(
-      (t) =>
-        t.type === 0 ||
-        t.type === 'AUDIO' ||
-        t.type === 'audio' ||
-        t.source === 2 ||          // TrackSource.MICROPHONE
-        t.source === 'MICROPHONE' ||
-        t.source === 'microphone'
-    );
-
-    if (!audioTrack) {
-      // No audio track published yet — nothing to mute this instant. When the
-      // track appears, the host can toggle again, or a fresh join re-triggers.
-      return res.json({ ok: true, applied: false, reason: 'no audio track yet' });
-    }
-
-    await svc.mutePublishedTrack(room, identity, audioTrack.sid, muted);
-
-    res.json({ ok: true, applied: true, muted: muted });
-  } catch (err) {
-    console.error('Mute participant error:', err);
-    res.status(500).json({ error: 'Failed to mute participant' });
   }
 });
 
@@ -750,13 +595,13 @@ app.post('/start-recording', async (req, res) => {
       return res.status(400).json({ error: 'room and username are required' });
     }
 
-    // The phone tells us directly whether THIS recorder is muted right now
-    // (they're a joiner in a soft/hard Nearby state). We trust this flag from
+    // The phone tells us directly whether THIS recorder's mic is off right now
+    // (joiners start muted and may not have unmuted). We trust this flag from
     // the app instead of trying to read LiveKit's source-side track "muted"
     // state, which proved unreliable: the joiner's mute happens locally on
     // their phone and doesn't consistently reflect in listParticipants(), so
     // the server saw them as unmuted and skipped compositing host audio =
-    // silent recordings. The app KNOWS its own Nearby/mute state, so it sends
+    // silent recordings. The app KNOWS its own mic state, so it sends
     // it. Accepts { muted: true|false }; defaults to false if absent.
     const clientSaysMuted = req.body?.muted === true;
 
@@ -831,7 +676,7 @@ app.post('/start-recording', async (req, res) => {
     const filepath = `${RECORDINGS_PREFIX}${room}/${eventPart}__${userPart}__${hostPart}__${stamp}.mp4`;
 
     // svc is used both here (to read the host's InstallID) and further down for
-    // the Nearby composite decision. Created once here so we don't build it
+    // the composite decision. Created once here so we don't build it
     // twice.
     const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
 
@@ -897,20 +742,17 @@ app.post('/start-recording', async (req, res) => {
 
     // Decide which kind of recording to start.
     //
-    // NORMAL (Nearby off, OR the recorder is the host): record this one
+    // NORMAL (mic live, OR the recorder is the host): record this one
     // participant's own feed (their video + their own audio) via Participant
-    // Egress — exactly as before.
+    // Egress.
     //
-    // NEARBY (soft or hard) + recorder is a JOINER whose mic is actually
-    // muted: the joiner's own audio is silent, so we composite the joiner's
-    // VIDEO with the HOST's AUDIO (the one unmuted voice) via Track Composite
-    // Egress. In SOFT mode a joiner may have overridden and turned their own
-    // mic back on (they walked out of the echo zone) — in that case their mic
-    // is live, so we record their OWN feed normally. We decide by checking the
-    // joiner's actual audio-track mute state at record-start (no mid-recording
-    // swap), which is exactly the rule we want.
+    // MUTED JOINER: joiners start muted on entry, so a joiner who records
+    // before unmuting would produce a silent file. In that case we composite
+    // the joiner's VIDEO with the HOST's AUDIO via Track Composite Egress. A
+    // joiner who HAS unmuted records their own feed normally. The decision is
+    // made once at record-start from the mic state the app reports — no
+    // mid-recording swap.
     // (svc was created earlier in this handler for the InstallID stamp.)
-    const nearbyMode = nearbyModes[room] || 'off';
     const hostIdentity = hostNames[room];
 
     let info;
@@ -920,8 +762,8 @@ app.post('/start-recording', async (req, res) => {
     // have their own live audio). Only a muted JOINER needs host audio composited.
     const recorderIsHost = hostIdentity && hostIdentity === username;
 
-    // COMPOSITE TRIGGER: the phone told us this recorder is muted (soft/hard
-    // Nearby), so recording their own feed would be silent. We use the app's
+    // COMPOSITE TRIGGER: the phone told us this recorder's mic is off, so
+    // recording their own feed would be silent. We use the app's
     // own flag rather than LiveKit's unreliable source-side muted state. Host
     // never composites (they have their own live audio).
     const recorderMicMuted = clientSaysMuted;
@@ -930,7 +772,7 @@ app.post('/start-recording', async (req, res) => {
     // can always see what the server received. If clientSaysMuted is false the
     // phone either isn't muted OR isn't sending the flag (old app build).
     console.log(
-      `[record-decision] room=${room} recorder=${username} nearbyFlag=${nearbyMode} ` +
+      `[record-decision] room=${room} recorder=${username} ` +
       `clientSaysMuted=${clientSaysMuted} recorderIsHost=${!!recorderIsHost} ` +
       `storedHost=${hostIdentity || 'NONE'} willComposite=${recorderMicMuted && !recorderIsHost}`
     );
@@ -957,7 +799,7 @@ app.post('/start-recording', async (req, res) => {
       // DIAGNOSTIC: log exactly what the composite decision sees, including the
       // live-audio result so a silent recording is immediately explainable.
       console.log(
-        `[record-decision] room=${room} recorder=${username} nearbyFlag=${nearbyMode} ` +
+        `[record-decision] room=${room} recorder=${username} ` +
         `recorderMicMuted=${joinerMicMuted} storedHost=${hostIdentity || 'NONE'} ` +
         `joinerVideoSid=${joinerTracks.videoSid || 'NONE'} ` +
         `liveAudioFrom=${liveAudio.identity || 'NONE'} ` +
@@ -1591,8 +1433,8 @@ app.post('/setevent', (req, res) => {
   const apiSecret = process.env.LIVEKIT_API_SECRET;
   if (event && event.length > 0) {
     eventNames[room] = event;
-    // Remember who the host is (their LiveKit identity) for composite
-    // recordings in Nearby mode. The app sends this when the host goes live.
+    // Remember who the host is (their LiveKit identity) so a muted joiner's
+    // recording can borrow host audio. The app sends this when the host goes live.
     if (host && String(host).trim().length > 0) {
       hostNames[room] = String(host).trim();
     }
@@ -1608,8 +1450,6 @@ app.post('/setevent', (req, res) => {
     // Also clear any leftover recording entries for this room so a fresh
     // session never inherits a stale "already recording" block.
     delete recordings[room];
-    // Clear Nearby mode too, so a fresh session starts in normal mode.
-    delete nearbyModes[room];
   }
   res.json({ ok: true });
 });
