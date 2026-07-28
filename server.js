@@ -729,12 +729,25 @@ app.post('/start-recording', async (req, res) => {
       },
     });
 
-    // Explicit recording dimensions (same as before) so the saved file is a
-    // true 9:16 phone-portrait canvas (1080 x 1920) and fills the screen in
-    // Apple Photos without black bars.
+    // Recording dimensions. These MUST match the camera's natural capture
+    // aspect (1920x1080 landscape — see captureDimensions in StreamManager,
+    // kept landscape because forcing portrait broke pinch-to-zoom).
+    //
+    // WHY THIS MATTERS: the two egress paths treat these differently.
+    //   - Participant Egress passes the source track through and effectively
+    //     ignores width/height, so it always produced natural-shape files.
+    //   - Track Composite Egress runs a real compositor and honors them
+    //     strictly. When this was set to 1080x1920 (portrait), the compositor
+    //     squeezed the 16:9 source into a 9:16 canvas and every composited
+    //     recording came out stretched tall and thin.
+    //
+    // Matching the source aspect here keeps BOTH paths producing the same
+    // undistorted shape. The gallery player uses .resizeAspect to letterbox on
+    // display, and export-to-Photos does the portrait reframe. True full-screen
+    // 9:16 recording needs the heavier Web Egress approach — still a V2 item.
     const encoding = new EncodingOptions({
-      width: 1080,
-      height: 1920,
+      width: 1920,
+      height: 1080,
       framerate: 30,
       videoBitrate: 4500, // kbps
       videoCodec: 0,      // H.264 baseline default for broad compatibility
