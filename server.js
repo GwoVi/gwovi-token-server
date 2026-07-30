@@ -970,20 +970,27 @@ app.get('/recordings', async (req, res) => {
     // Newest first.
     media.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
-    // Build a temporary signed URL (valid 1 hour) for each one, and read back
-    // the InstallID metadata we stamped at record time (recorder + host) so the
-    // app can hide a blocked person's recordings by InstallID. Metadata isn't
-    // returned by ListObjects, so we HEAD each object. Recording counts are
-    // small, so the extra calls are cheap; a HEAD failure just yields no stamp.
+    // ---- OWNERSHIP FILTER (hotfix, Jul 30) ----
+    //
+    // Every install currently shares one hardcoded room ("test-room"), so this
+    // listing would otherwise hand every user every other user's recordings.
+    // Until sessions get unique room IDs, scope the listing to the caller:
+    // recordings they made themselves, or recordings from a session they
+    // hosted (so a host can still manage their own session's media).
+    //
+    // FAIL CLOSED: a request that doesn't identify itself gets an empty list.
+    // That is deliberate — builds already in testers' hands don't send
+    // installId, so they see nothing at all rather than everything. No app
+    // update is needed for the leak to stop.
+    //
+    // ORDER MATTERS: the metadata check happens BEFORE the signed URL is
+    // generated. Signing first and filtering later would still put working
+    // one-hour download links for other people's media into the response body,
+    // where filtering in the app could not undo it.
+    const requesterId = (req.query.installId || '').trim();
+
     const out = [];
     for (const v of media) {
-      const url = await getSignedUrl(
-        s3,
-        new GetObjectCommand({ Bucket: r2Bucket, Key: v.Key }),
-        { expiresIn: 3600 }
-      );
-      const isPhoto = v.Key.endsWith('.jpg') || v.Key.endsWith('.jpeg');
-
       let installId = null;
       let hostInstallId = null;
       try {
@@ -997,6 +1004,17 @@ app.get('/recordings', async (req, res) => {
       } catch (e) {
         // No metadata / HEAD failed — leave both null.
       }
+
+      // Unidentified caller, or media that isn't theirs: skip before signing.
+      if (!requesterId) continue;
+      if (installId !== requesterId && hostInstallId !== requesterId) continue;
+
+      const url = await getSignedUrl(
+        s3,
+        new GetObjectCommand({ Bucket: r2Bucket, Key: v.Key }),
+        { expiresIn: 3600 }
+      );
+      const isPhoto = v.Key.endsWith('.jpg') || v.Key.endsWith('.jpeg');
 
       out.push({
         key: v.Key,
