@@ -20,6 +20,100 @@ import {
   CopyObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import crypto from 'node:crypto';
+
+// ---- SESSION TOKENS (added Jul 30, privacy incident) -----------------------
+//
+// WHY THIS EXISTS. The earlier hotfix filtered /recordings by an installId sent
+// in the query string. That is not authorization, because installIds are NOT
+// secret: StreamManager publishes each participant's installId in their LiveKit
+// participant metadata (deliberately — it's what makes block-by-installId work).
+// So anyone who shared a session with you could read your installId and then ask
+// for your media. Filtering on a value the caller supplies is a filter, not a
+// lock.
+//
+// The fix: the server issues a signed token at /token, and every endpoint that
+// touches media verifies it and reads room + installId FROM THE VERIFIED
+// PAYLOAD — never from the query string or body. A caller can no longer name
+// somebody else.
+//
+// Token shape: base64url(JSON payload) + "." + base64url(HMAC-SHA256 of that).
+// Stateless on purpose — nothing to persist, so a Render redeploy can't lose it.
+//
+// FAILS CLOSED: if SESSION_SECRET isn't set, verification always fails and the
+// protected endpoints return 401. That is intentional. A privacy fix that
+// silently degrades to "allow everything" when misconfigured is not a fix.
+const SESSION_SECRET = process.env.SESSION_SECRET;
+
+// Six hours, matching the LiveKit token TTL so they expire together.
+const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+
+function makeSessionToken({ installId, room, role }) {
+  if (!SESSION_SECRET) return null;
+  const payload = {
+    installId,
+    room,
+    role: role === 'host' ? 'host' : 'joiner',
+    exp: Date.now() + SESSION_TTL_MS,
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(body)
+    .digest('base64url');
+  return `${body}.${sig}`;
+}
+
+// Returns the verified payload, or null if anything is wrong. Never throws.
+function verifySessionToken(token) {
+  if (!SESSION_SECRET) return null;
+  if (typeof token !== 'string' || token.length === 0) return null;
+
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [body, sig] = parts;
+
+  const expected = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(body)
+    .digest('base64url');
+
+  // Constant-time compare so the signature can't be brute-forced a byte at a
+  // time by measuring how long the comparison takes.
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return null;
+  if (!crypto.timingSafeEqual(a, b)) return null;
+
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object') return null;
+  if (typeof payload.exp !== 'number' || Date.now() > payload.exp) return null;
+  if (typeof payload.installId !== 'string' || !payload.installId) return null;
+  if (typeof payload.room !== 'string' || !payload.room) return null;
+  return payload;
+}
+
+// Route guard. Pulls the token from the header (preferred), or from the query
+// string / body as a fallback so the app can send it whichever way is easiest
+// at each call site. Responds 401 and returns null when it doesn't verify —
+// callers should `if (!session) return;` immediately.
+function requireSession(req, res) {
+  const raw =
+    req.get('X-GwoVi-Session') ||
+    req.query?.sessionToken ||
+    (req.body && req.body.sessionToken);
+  const payload = verifySessionToken(raw);
+  if (!payload) {
+    res.status(401).json({ error: 'unauthorized' });
+    return null;
+  }
+  return payload;
+}
 
 const app = express();
 app.use(cors());
@@ -568,7 +662,33 @@ app.post('/token', async (req, res) => {
     at.addGrant(grant);
 
     const token = await at.toJwt();
-    res.json({ token });
+
+    // Mint the companion session token. This is what authorizes the media
+    // endpoints (/recordings, /upload-snapshot, /start-recording,
+    // /stop-recording, /delete-recording). It binds this caller to THIS room
+    // and THIS installId, so those endpoints never have to trust a room or
+    // installId the client claims later.
+    //
+    // Note: a session token is only issued here, and reaching here means the
+    // caller already passed the ban check and the capacity check. For joiners
+    // the app only calls /token after the host approves them, so approval
+    // remains the real gate — the room code alone gets you nothing.
+    const sessionToken = makeSessionToken({
+      installId: installId || null,
+      room,
+      role: isHost === true ? 'host' : 'joiner',
+    });
+
+    if (!sessionToken) {
+      // SESSION_SECRET missing. Say so loudly rather than handing back a token
+      // that won't work and letting it fail confusingly three calls later.
+      console.error(
+        '[token] SESSION_SECRET is not set — cannot mint session tokens. ' +
+        'Media endpoints will reject every request until it is configured.'
+      );
+    }
+
+    res.json({ token, sessionToken });
   } catch (err) {
     console.error('Token error:', err);
     res.status(500).json({ error: 'Failed to create token' });
@@ -590,11 +710,14 @@ app.post('/start-recording', async (req, res) => {
     `[start-recording] HIT room=${req.body?.room} user=${req.body?.username}`
   );
   try {
-    const { room, username } = req.body || {};
-    if (!room || !username) {
-      return res.status(400).json({ error: 'room and username are required' });
-    }
+    const session = requireSession(req, res);
+    if (!session) return;
 
+    const room = session.room;
+    const { username } = req.body || {};
+    if (!username) {
+      return res.status(400).json({ error: 'username is required' });
+    }
     // The phone tells us directly whether THIS recorder's mic is off right now
     // (joiners start muted and may not have unmuted). We trust this flag from
     // the app instead of trying to read LiveKit's source-side track "muted"
@@ -605,12 +728,11 @@ app.post('/start-recording', async (req, res) => {
     // it. Accepts { muted: true|false }; defaults to false if absent.
     const clientSaysMuted = req.body?.muted === true;
 
-    // The recorder's own InstallID, sent by the phone (same value it sends to
-    // /token). Stamped onto the recording as R2 object metadata so the gallery
-    // can hide a blocked person's recordings by InstallID, not by username.
-    // Optional: an older app build that doesn't send it just yields no stamp.
-    const recorderInstallId =
-      typeof req.body?.installId === 'string' ? req.body.installId : null;
+    // The recorder's InstallID now comes from the VERIFIED session token, not
+    // from the request body. Stamped onto the recording as R2 object metadata,
+    // which is what /recordings and /delete-recording check ownership against —
+    // so it has to be a value the client can't forge.
+    const recorderInstallId = session.installId;
 
     const apiKey = process.env.LIVEKIT_API_KEY;
     const apiSecret = process.env.LIVEKIT_API_SECRET;
@@ -882,9 +1004,13 @@ app.post('/start-recording', async (req, res) => {
 // CHANGED: stops THIS person's recording only. App sends { room, username }.
 app.post('/stop-recording', async (req, res) => {
   try {
-    const { room, username } = req.body || {};
-    if (!room || !username) {
-      return res.status(400).json({ error: 'room and username are required' });
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const room = session.room;
+    const { username } = req.body || {};
+    if (!username) {
+      return res.status(400).json({ error: 'username is required' });
     }
 
     const apiKey = process.env.LIVEKIT_API_KEY;
@@ -923,10 +1049,13 @@ app.post('/stop-recording', async (req, res) => {
 // ---- List recordings for a room, with temporary signed playback URLs ----
 app.get('/recordings', async (req, res) => {
   try {
-    const room = req.query.room;
-    if (!room) {
-      return res.status(400).json({ error: 'room is required' });
-    }
+    // AUTHORIZATION, not filtering. Room and identity both come from the
+    // signed token — a caller cannot ask for a room they weren't issued a
+    // token for, and cannot name someone else's installId.
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const room = session.room;
 
     const r2Bucket = process.env.R2_BUCKET;
     const s3 = makeR2Client();
@@ -970,24 +1099,16 @@ app.get('/recordings', async (req, res) => {
     // Newest first.
     media.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
-    // ---- OWNERSHIP FILTER (hotfix, Jul 30) ----
+    // Read each object's InstallID metadata (stamped at record time) and keep
+    // only what belongs to this caller — media they recorded, or media from a
+    // session they hosted. Metadata isn't returned by ListObjects, so we HEAD
+    // each object. Counts are small, so the extra calls are cheap.
     //
-    // Every install currently shares one hardcoded room ("test-room"), so this
-    // listing would otherwise hand every user every other user's recordings.
-    // Until sessions get unique room IDs, scope the listing to the caller:
-    // recordings they made themselves, or recordings from a session they
-    // hosted (so a host can still manage their own session's media).
-    //
-    // FAIL CLOSED: a request that doesn't identify itself gets an empty list.
-    // That is deliberate — builds already in testers' hands don't send
-    // installId, so they see nothing at all rather than everything. No app
-    // update is needed for the leak to stop.
-    //
-    // ORDER MATTERS: the metadata check happens BEFORE the signed URL is
-    // generated. Signing first and filtering later would still put working
-    // one-hour download links for other people's media into the response body,
-    // where filtering in the app could not undo it.
-    const requesterId = (req.query.installId || '').trim();
+    // ORDER MATTERS: the ownership check happens BEFORE getSignedUrl. Signing
+    // first and filtering afterwards would still put working one-hour download
+    // links for other people's media into the response body, where no amount
+    // of filtering in the app could undo it.
+    const requesterId = session.installId;
 
     const out = [];
     for (const v of media) {
@@ -1002,10 +1123,10 @@ app.get('/recordings', async (req, res) => {
         installId = md.installid || null;
         hostInstallId = md.hostinstallid || null;
       } catch (e) {
-        // No metadata / HEAD failed — leave both null.
+        // No metadata / HEAD failed — leave both null, which fails closed below.
       }
 
-      // Unidentified caller, or media that isn't theirs: skip before signing.
+      // Not theirs: skip it, and crucially skip it before signing anything.
       if (!requesterId) continue;
       if (installId !== requesterId && hostInstallId !== requesterId) continue;
 
@@ -1044,9 +1165,13 @@ app.get('/recordings', async (req, res) => {
 // host can delete it. Covered by the same 24h auto-delete lifecycle rule.
 app.post('/upload-snapshot', async (req, res) => {
   try {
-    const { room, event, image } = req.body || {};
-    if (!room || !image) {
-      return res.status(400).json({ error: 'room and image are required' });
+    const session = requireSession(req, res);
+    if (!session) return;
+
+    const room = session.room;
+    const { event, image } = req.body || {};
+    if (!image) {
+      return res.status(400).json({ error: 'image is required' });
     }
 
     const r2Bucket = process.env.R2_BUCKET;
@@ -1069,7 +1194,39 @@ app.post('/upload-snapshot', async (req, res) => {
     const eventPart = safeEvent.length > 0 ? safeEvent : 'GwoVi';
     const hostPart = safeHost.length > 0 ? safeHost : 'host';
     const stamp = Date.now();
-    const key = `${room}/${eventPart}__Snap__${hostPart}__${stamp}.jpg`;
+    // BUG FIXED Jul 30: this used to write to the bare `${room}/...` path.
+    // Two consequences, both bad:
+    //   1. The R2 24-hour lifecycle rule is scoped to the `recordings/` prefix,
+    //      so snapshots written outside it NEVER auto-deleted — contradicting
+    //      both the Privacy Policy and the app's own promise.
+    //   2. No ownership metadata was stamped, so once /recordings started
+    //      filtering by owner, snapshots could never match anyone.
+    // Writing under RECORDINGS_PREFIX fixes the retention hole; stamping
+    // installid/hostinstallid below fixes the ownership hole.
+    const key = `${RECORDINGS_PREFIX}${room}/${eventPart}__Snap__${hostPart}__${stamp}.jpg`;
+
+    // Same ownership stamps videos get, so the gallery filter treats photos and
+    // videos identically. The uploader's ID comes from the VERIFIED session,
+    // not from the request body — a client can't claim to be someone else.
+    const snapMetadata = { installid: session.installId };
+    try {
+      const hostIdentityForStamp = hostNames[room];
+      if (hostIdentityForStamp) {
+        const apiKey = process.env.LIVEKIT_API_KEY;
+        const apiSecret = process.env.LIVEKIT_API_SECRET;
+        if (apiKey && apiSecret) {
+          const svc = new RoomServiceClient(LIVEKIT_HOST, apiKey, apiSecret);
+          const hostInstallId = await getParticipantInstallId(
+            svc,
+            room,
+            hostIdentityForStamp
+          );
+          if (hostInstallId) snapMetadata.hostinstallid = hostInstallId;
+        }
+      }
+    } catch (e) {
+      console.log('Snapshot host stamp note:', e?.message || e);
+    }
 
     await s3.send(
       new PutObjectCommand({
@@ -1077,6 +1234,7 @@ app.post('/upload-snapshot', async (req, res) => {
         Key: key,
         Body: buffer,
         ContentType: 'image/jpeg',
+        Metadata: snapMetadata,
       })
     );
 
@@ -1422,6 +1580,13 @@ app.get('/admin/bans', async (req, res) => {
 
 app.post('/delete-recording', async (req, res) => {
   try {
+    // Was previously UNAUTHENTICATED and UNSCOPED: any caller who knew (or
+    // guessed) a key could delete anyone's media, guarded only by a check that
+    // the key looked like a media file. Now the caller must present a valid
+    // session token, and may only delete media that belongs to them.
+    const session = requireSession(req, res);
+    if (!session) return;
+
     const { key } = req.body || {};
     if (!key) {
       return res.status(400).json({ error: 'key is required' });
@@ -1437,10 +1602,39 @@ app.post('/delete-recording', async (req, res) => {
       return res.status(400).json({ error: 'invalid key' });
     }
 
+    // The key must belong to the room this session was issued for. Blocks
+    // reaching sideways into another room's media with a valid token.
+    const inNewPath = key.startsWith(`${RECORDINGS_PREFIX}${session.room}/`);
+    const inLegacyPath = key.startsWith(`${session.room}/`);
+    if (!inNewPath && !inLegacyPath) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
     const r2Bucket = process.env.R2_BUCKET;
     const s3 = makeR2Client();
     if (!s3 || !r2Bucket) {
       return res.status(500).json({ error: 'Server missing R2 credentials' });
+    }
+
+    // Ownership check against the object's own metadata. The recorder may
+    // delete their own file; the session host may delete anything from the
+    // session they hosted (which is the delete authority the gallery already
+    // shows). Anything unstamped fails closed.
+    let ownerId = null;
+    let hostId = null;
+    try {
+      const head = await s3.send(
+        new HeadObjectCommand({ Bucket: r2Bucket, Key: key })
+      );
+      const md = head?.Metadata || {};
+      ownerId = md.installid || null;
+      hostId = md.hostinstallid || null;
+    } catch (e) {
+      return res.status(404).json({ error: 'not found' });
+    }
+
+    if (ownerId !== session.installId && hostId !== session.installId) {
+      return res.status(403).json({ error: 'forbidden' });
     }
 
     await s3.send(
@@ -1550,4 +1744,12 @@ app.get('/check', (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`GwoVi token server listening on port ${port}`);
+  if (!SESSION_SECRET) {
+    console.error(
+      '*** SESSION_SECRET is NOT set. Session tokens cannot be issued or ' +
+      'verified, so /recordings, /upload-snapshot, /start-recording, ' +
+      '/stop-recording and /delete-recording will reject EVERY request with ' +
+      '401. Set SESSION_SECRET in the Render environment. ***'
+    );
+  }
 });
