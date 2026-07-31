@@ -415,14 +415,40 @@ function roomRequests(room) {
   return requests[room];
 }
 
+// Ages out stale join requests.
+//
+// PENDING requests expire quickly (2 minutes) — an unanswered knock shouldn't
+// sit in the host's list forever.
+//
+// APPROVED and DENIED entries are kept far longer, because /token now consults
+// them: a joiner is only issued a session token if the host actually approved
+// them, so throwing the approval away after two minutes would lock out anyone
+// who took a moment to connect, or who dropped and rejoined mid-session. They
+// are cleared wholesale when the room finishes (clearRoomState).
+const PENDING_TTL_MS = 2 * 60 * 1000;        // 2 minutes
+const DECISION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+
 function pruneOld(room) {
   const now = Date.now();
   const list = roomRequests(room);
   for (const name of Object.keys(list)) {
-    if (now - list[name].ts > 120000) {
+    const entry = list[name];
+    const ttl = entry.status === 'pending' ? PENDING_TTL_MS : DECISION_TTL_MS;
+    if (now - entry.ts > ttl) {
       delete list[name];
     }
   }
+}
+
+// Whether this username has been approved to join this room. Used by /token.
+// Note this is in-memory: a Render restart clears it, and the joiner would need
+// the host to approve again. The room's event name lives in memory too and
+// vanishes on the same restart, so the code stops resolving anyway — the two
+// fail together rather than leaving a confusing half-state.
+function isApprovedJoiner(room, username) {
+  if (!room || !username) return false;
+  const entry = requests[room]?.[username];
+  return entry?.status === 'approved';
 }
 
 // Arms the "abandoned room" cleanup timer for a room. Its ONLY job is to clean
@@ -634,6 +660,28 @@ app.post('/token', async (req, res) => {
       }
     } catch (capErr) {
       console.log('Capacity check note:', capErr?.message || capErr);
+    }
+
+    // APPROVAL GATE — this is what makes session-wide gallery access safe.
+    //
+    // A session token unlocks everything recorded in its room, so issuing one
+    // on nothing more than a room name would mean a forwarded join code was
+    // enough to see the whole session's media. Approval was already required by
+    // the app's join flow; enforcing it here moves it from a UI convention to
+    // something the server actually checks.
+    //
+    // Hosts are exempt (they created the room). Solo/Home rooms are exempt
+    // too — they're derived from the caller's own InstallID, so there is nobody
+    // to approve them and nobody else who could ask for that room.
+    const isSoloRoom = typeof room === 'string' && room.startsWith('solo-');
+    if (isHost !== true && !isSoloRoom) {
+      pruneOld(room);
+      if (!isApprovedJoiner(room, username)) {
+        console.log(
+          `[token] REFUSED ${username} for ${room} — no host approval on record`
+        );
+        return res.status(403).json({ error: 'not_approved' });
+      }
     }
 
     const at = new AccessToken(apiKey, apiSecret, {
@@ -1099,17 +1147,23 @@ app.get('/recordings', async (req, res) => {
     // Newest first.
     media.sort((a, b) => new Date(b.LastModified) - new Date(a.LastModified));
 
-    // Read each object's InstallID metadata (stamped at record time) and keep
-    // only what belongs to this caller — media they recorded, or media from a
-    // session they hosted. Metadata isn't returned by ListObjects, so we HEAD
-    // each object. Counts are small, so the extra calls are cheap.
+    // ---- SESSION-WIDE LISTING ----
     //
-    // ORDER MATTERS: the ownership check happens BEFORE getSignedUrl. Signing
-    // first and filtering afterwards would still put working one-hour download
-    // links for other people's media into the response body, where no amount
-    // of filtering in the app could undo it.
-    const requesterId = session.installId;
-
+    // Everything in this room is returned, not just the caller's own files.
+    // That IS the product: several people record the same moment from different
+    // angles and the group ends up with all of them. A gallery that handed each
+    // person only their own recording back would defeat the point of the app.
+    //
+    // What makes that safe now is the room, not a per-file filter. Every session
+    // has its own room named by the host's join code, a joiner only gets a token
+    // after the host approves them, and /token refuses to mint one otherwise. So
+    // "everyone in the room sees the room's media" is a statement about a group
+    // that was individually let in — which is different in kind from the shared
+    // `test-room` that caused the July 30 incident, where "the room" meant every
+    // install on earth.
+    //
+    // The InstallIDs still ride along in the response so the app can hide a
+    // blocked person's recordings locally.
     const out = [];
     for (const v of media) {
       let installId = null;
@@ -1123,12 +1177,9 @@ app.get('/recordings', async (req, res) => {
         installId = md.installid || null;
         hostInstallId = md.hostinstallid || null;
       } catch (e) {
-        // No metadata / HEAD failed — leave both null, which fails closed below.
+        // No metadata / HEAD failed — leave both null. The file is still shown;
+        // it's in this room, which is what authorizes it.
       }
-
-      // Not theirs: skip it, and crucially skip it before signing anything.
-      if (!requesterId) continue;
-      if (installId !== requesterId && hostInstallId !== requesterId) continue;
 
       const url = await getSignedUrl(
         s3,
