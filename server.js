@@ -45,16 +45,48 @@ import crypto from 'node:crypto';
 // silently degrades to "allow everything" when misconfigured is not a fix.
 const SESSION_SECRET = process.env.SESSION_SECRET;
 
-// Six hours, matching the LiveKit token TTL so they expire together.
-const SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+// TWENTY-FIVE HOURS — deliberately one hour LONGER than media survives.
+//
+// This was six hours, matched to the LiveKit streaming token. That was a bug,
+// not a policy. Recordings live 24 hours in R2, so a token that died at six
+// left an 18-hour window where a session's files existed but nobody could read
+// them: /recordings returned 401, the gallery skipped the section, and it
+// looked exactly like the recordings had been deleted early. Confirmed Jul 31
+// by opening the bucket — the .mp4s were all still there.
+//
+// An access token should never expire before the thing it protects. It grants
+// nothing new: the media is gone at 24 hours regardless, and the token only
+// ever unlocks a room the holder was admitted to.
+//
+// NOTE: this is the SESSION token (media access), not the LiveKit streaming
+// token, which stays at six hours.
+const SESSION_TTL_MS = 25 * 60 * 60 * 1000;
+
+// ...but WRITES stay on the old six-hour clock.
+//
+// Reads are safe to keep alive for a full day. Writes are not the same thing:
+// /start-recording kicks off a LiveKit egress, which costs money and drops a
+// new file into a session that has probably moved on without you. A token
+// that's a day old should not be able to do that. So the long TTL buys back
+// the gallery without also handing out a 25-hour write window.
+//
+// Applies to /start-recording and /upload-snapshot. NOT to /stop-recording (a
+// recording started in the window must always be stoppable) and NOT to
+// /delete-recording (already bounded by an ownership check, and you should be
+// able to delete your own clip for as long as it exists).
+const SESSION_WRITE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 function makeSessionToken({ installId, room, role }) {
   if (!SESSION_SECRET) return null;
+  const now = Date.now();
   const payload = {
     installId,
     room,
     role: role === 'host' ? 'host' : 'joiner',
-    exp: Date.now() + SESSION_TTL_MS,
+    // iat is what makes the write-freshness check possible. Tokens minted
+    // before this change don't carry it — see requireFreshSession.
+    iat: now,
+    exp: now + SESSION_TTL_MS,
   };
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto
@@ -112,6 +144,31 @@ function requireSession(req, res) {
     res.status(401).json({ error: 'unauthorized' });
     return null;
   }
+  return payload;
+}
+
+// Stricter guard for the endpoints that CREATE things. Everything
+// requireSession checks, plus: the token must have been issued recently.
+//
+// Legacy tokens (minted before iat existed) carried a six-hour TTL, so any one
+// still unexpired is by definition less than six hours old — those pass. This
+// is a real inference, not a courtesy: a token that can't prove its age but
+// couldn't have been older than the limit anyway is fine.
+function requireFreshSession(req, res) {
+  const payload = requireSession(req, res);
+  if (!payload) return null;
+
+  if (typeof payload.iat === 'number') {
+    const age = Date.now() - payload.iat;
+    if (age > SESSION_WRITE_MAX_AGE_MS) {
+      // 401 rather than 403 so the app's existing "session expired — rejoin"
+      // handling fires. The distinct error string is there for the logs and
+      // for a future build that wants to say something more precise.
+      res.status(401).json({ error: 'session_stale' });
+      return null;
+    }
+  }
+
   return payload;
 }
 
@@ -758,7 +815,10 @@ app.post('/start-recording', async (req, res) => {
     `[start-recording] HIT room=${req.body?.room} user=${req.body?.username}`
   );
   try {
-    const session = requireSession(req, res);
+    // FRESH session required: starting a recording launches a paid egress and
+    // writes a new file into the room. A day-old token can read the gallery
+    // but must not be able to do this.
+    const session = requireFreshSession(req, res);
     if (!session) return;
 
     const room = session.room;
@@ -1052,6 +1112,9 @@ app.post('/start-recording', async (req, res) => {
 // CHANGED: stops THIS person's recording only. App sends { room, username }.
 app.post('/stop-recording', async (req, res) => {
   try {
+    // Deliberately NOT requireFreshSession. Anything that was legitimately
+    // started must stay stoppable, or a long recording could outlive its
+    // token's write window and be stranded running.
     const session = requireSession(req, res);
     if (!session) return;
 
@@ -1216,7 +1279,9 @@ app.get('/recordings', async (req, res) => {
 // host can delete it. Covered by the same 24h auto-delete lifecycle rule.
 app.post('/upload-snapshot', async (req, res) => {
   try {
-    const session = requireSession(req, res);
+    // FRESH session required — same reasoning as /start-recording: this writes
+    // a new object into the room's storage.
+    const session = requireFreshSession(req, res);
     if (!session) return;
 
     const room = session.room;
@@ -1635,6 +1700,10 @@ app.post('/delete-recording', async (req, res) => {
     // guessed) a key could delete anyone's media, guarded only by a check that
     // the key looked like a media file. Now the caller must present a valid
     // session token, and may only delete media that belongs to them.
+    //
+    // Deliberately NOT requireFreshSession: this is already bounded by an
+    // ownership check against the object's own metadata, and you should be
+    // able to delete your own clip for as long as that clip exists.
     const session = requireSession(req, res);
     if (!session) return;
 
