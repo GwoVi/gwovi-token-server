@@ -959,25 +959,34 @@ app.post('/start-recording', async (req, res) => {
       },
     });
 
-    // Recording dimensions. These MUST match the camera's natural capture
-    // aspect (1920x1080 landscape — see captureDimensions in StreamManager,
-    // kept landscape because forcing portrait broke pinch-to-zoom).
+    // Recording dimensions.
     //
-    // WHY THIS MATTERS: the two egress paths treat these differently.
-    //   - Participant Egress passes the source track through and effectively
-    //     ignores width/height, so it always produced natural-shape files.
-    //   - Track Composite Egress runs a real compositor and honors them
-    //     strictly. When this was set to 1080x1920 (portrait), the compositor
-    //     squeezed the 16:9 source into a 9:16 canvas and every composited
-    //     recording came out stretched tall and thin.
+    // PORTRAIT, deliberately — corrected Aug 3. The camera CAPTURES landscape
+    // 1920x1080 (see captureDimensions in StreamManager, kept landscape because
+    // forcing portrait broke pinch-to-zoom), but the phone is held upright, so
+    // rotation is applied and the track LiveKit actually receives is PORTRAIT.
+    // The LiveKit dashboard confirms it: the published layers are
+    // 180x320 / 360x640 / 1080x1920.
     //
-    // Matching the source aspect here keeps BOTH paths producing the same
-    // undistorted shape. The gallery player uses .resizeAspect to letterbox on
-    // display, and export-to-Photos does the portrait reframe. True full-screen
-    // 9:16 recording needs the heavier Web Egress approach — still a V2 item.
+    // The old value here was landscape 1920x1080, matching the capture rather
+    // than the published track. That was never tested in anger, because the
+    // options weren't reaching egress at all (see the call sites below) — every
+    // recording was silently made with egress's default 720p preset. Now that
+    // the options land, the dimensions have to match the real track or the
+    // compositor will letterbox or squeeze it.
+    //
+    // NOTE FOR WHOEVER TESTS THIS: the Jul 27 fix supposedly cured a squeezed
+    // composite recording by switching this from portrait to landscape. That
+    // can't have been the mechanism if the options never arrived, so treat the
+    // Jul 27 conclusion as unverified and watch the shape of the first
+    // composite recording after this deploy. If it comes out stretched, this
+    // constant is the first thing to flip back.
+    //
+    // At 1080x1920 the file is already 9:16, so cropToPortrait in GalleryView
+    // has nothing to trim and saves land at full 1080x1920.
     const encoding = new EncodingOptions({
-      width: 1920,
-      height: 1080,
+      width: 1080,
+      height: 1920,
       framerate: 30,
       videoBitrate: 4500, // kbps
       videoCodec: 0,      // H.264 baseline default for broad compatibility
@@ -1056,11 +1065,18 @@ app.post('/start-recording', async (req, res) => {
             room,
             {
               file: fileOutput,
-              encodingOptions: encoding,
             },
             {
               audioTrackId: liveAudio.audioSid,
               videoTrackId: joinerTracks.videoSid,
+              // BUG FIXED Aug 3: encodingOptions used to sit in the OUTPUT
+              // argument above, next to `file`. The SDK's output type only
+              // understands file/stream/segments/image, so it silently dropped
+              // it — the egress request recorded in the LiveKit dashboard
+              // contained no options at all, and egress fell back to its
+              // default H264_720P_30 preset. That is where every 1280x720
+              // recording came from. It belongs HERE, in the options argument.
+              encodingOptions: encoding,
             }
           );
           usedComposite = true;
@@ -1089,6 +1105,10 @@ app.post('/start-recording', async (req, res) => {
         username,
         {
           file: fileOutput,
+        },
+        {
+          // Same fix as the composite path above: options go in their own
+          // argument, not folded into the output object.
           encodingOptions: encoding,
         }
       );
